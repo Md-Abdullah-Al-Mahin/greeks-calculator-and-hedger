@@ -1,0 +1,28 @@
+{
+    "include": [
+        "src",
+        "notebooks",
+        "tests"
+    ],
+    "exclude": [
+        "**/__pycache__",
+        "**/node_modules",
+        "**/.venv"
+    ],
+    "executionEnvironments": [
+        {
+            "root": "src",
+            "pythonVersion": "3.8"
+        },
+        {
+            "root": "notebooks",
+            "pythonVersion": "3.8",
+            "extraPaths": ["src"]
+        },
+        {
+            "root": "tests",
+            "pythonVersion": "3.8",
+            "extraPaths": ["src"]
+        }
+    ]
+}
