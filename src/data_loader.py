@@ -76,8 +76,8 @@ class DataLoader:
             metadata = {'timestamp': datetime.now().isoformat(), 'cache_key': cache_key, 'rows': len(data)}
             with open(self._get_cache_path(cache_key, metadata=True), 'w') as f:
                 json.dump(metadata, f, indent=2)
-        except Exception as e:
-            print(f"Warning: Could not save cache for {cache_key}: {str(e)}")
+        except Exception:
+            pass
     
     def _get_price(self, ticker: yf.Ticker, info: Dict) -> Optional[float]:
         """Extract price from ticker info or history."""
@@ -136,9 +136,10 @@ class DataLoader:
         """
         cache_key = f"stock_data_{'_'.join(sorted(symbols))}"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
-            print(f"Loaded stock data from cache for {len(symbols)} symbols")
+            print(f"Using cached stock data for {len(symbols)} symbols")
             return cached
         
+        print(f"Fetching stock data for {len(symbols)} symbols")
         results = []
         current_time = datetime.now()
         
@@ -149,7 +150,6 @@ class DataLoader:
                 
                 spot_price = self._get_price(ticker, info)
                 if spot_price is None:
-                    print(f"Warning: Could not fetch price for {symbol}, skipping...")
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
@@ -162,8 +162,7 @@ class DataLoader:
                     'borrow_cost_bps': float(borrow_cost_bps),
                     'last_updated': current_time.isoformat()
                 })
-            except Exception as e:
-                print(f"Error fetching data for {symbol}: {str(e)}")
+            except Exception:
                 continue
         
         if not results:
@@ -172,6 +171,7 @@ class DataLoader:
         df = pd.DataFrame(results)
         if use_cache:
             self._save_to_cache(df, cache_key)
+        print(f"Fetched stock data for {len(df)} symbols")
         return df
     
     def fetch_risk_free_rates(self, use_cache: bool = True) -> pd.DataFrame:
@@ -186,8 +186,10 @@ class DataLoader:
         """
         cache_key = "risk_free_rates"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
-            print("Loaded risk-free rates from cache")
+            print("Using cached risk-free rates")
             return cached
+        
+        print("Fetching risk-free rates")
         
         if not HAS_DATAREADER or web is None:
             raise ImportError("pandas-datareader is required. Install with: pip install pandas-datareader")
@@ -218,8 +220,7 @@ class DataLoader:
                         'tenor_days': tenor_days,
                         'rate': float(rate)
                     })
-            except Exception as e:
-                print(f"Warning: Could not fetch {series_id} ({tenor_days} days): {str(e)}")
+            except Exception:
                 continue
         
         if not results:
@@ -228,6 +229,7 @@ class DataLoader:
         df = pd.DataFrame(results).sort_values('tenor_days')
         if use_cache:
             self._save_to_cache(df, cache_key)
+        print(f"Fetched {len(df)} risk-free rate tenors")
         return df
     
     def fetch_options_chain(self, symbol: str, use_cache: bool = True) -> pd.DataFrame:
@@ -244,15 +246,16 @@ class DataLoader:
         """
         cache_key = f"options_chain_{symbol}"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
-            print(f"Loaded options chain from cache for {symbol}")
+            print(f"Using cached options chain for {symbol}")
             return cached
+        
+        print(f"Fetching options chain for {symbol}")
         
         try:
             ticker = yf.Ticker(symbol)
             expirations = ticker.options
             
             if not expirations:
-                print(f"Warning: No options data available for {symbol}")
                 return pd.DataFrame()
             
             all_options = []
@@ -269,8 +272,7 @@ class DataLoader:
                             df_copy['expiry'] = expiry
                             df_copy['symbol'] = symbol
                             all_options.append(df_copy)
-                except Exception as e:
-                    print(f"Warning: Could not fetch options for {symbol} expiry {expiry}: {str(e)}")
+                except Exception:
                     continue
             
             if not all_options:
@@ -297,10 +299,11 @@ class DataLoader:
             
             if use_cache and isinstance(df_result, pd.DataFrame) and not df_result.empty:
                 self._save_to_cache(df_result, cache_key)
+            if isinstance(df_result, pd.DataFrame) and not df_result.empty:
+                print(f"Fetched {len(df_result)} options for {symbol}")
             return df_result if isinstance(df_result, pd.DataFrame) else pd.DataFrame()
             
-        except Exception as e:
-            print(f"Error fetching options chain for {symbol}: {str(e)}")
+        except Exception:
             return pd.DataFrame()
     
     def build_volatility_surface(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
@@ -316,8 +319,10 @@ class DataLoader:
         """
         cache_key = f"volatility_surface_{'_'.join(sorted(symbols))}"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
-            print(f"Loaded volatility surface from cache for {len(symbols)} symbols")
+            print(f"Using cached volatility surface for {len(symbols)} symbols")
             return cached
+        
+        print(f"Building volatility surface for {len(symbols)} symbols")
         
         all_surfaces = []
         
@@ -325,8 +330,7 @@ class DataLoader:
         try:
             market_data = self.fetch_stock_data(symbols)
             spot_prices = dict(zip(market_data['symbol'], market_data['spot_price']))
-        except Exception as e:
-            print(f"Warning: Could not fetch spot prices: {str(e)}")
+        except Exception:
             spot_prices = {}
         
         for symbol in symbols:
@@ -335,7 +339,6 @@ class DataLoader:
                 options_df = self.fetch_options_chain(symbol)
                 
                 if options_df.empty:
-                    print(f"Warning: No options data for {symbol}, skipping...")
                     continue
                 
                 # Get spot price
@@ -369,11 +372,8 @@ class DataLoader:
                     ]
                     
                     all_surfaces.append(surface_df)
-                else:
-                    print(f"Warning: No implied volatility data for {symbol}")
                     
-            except Exception as e:
-                print(f"Error building volatility surface for {symbol}: {str(e)}")
+            except Exception:
                 continue
         
         if not all_surfaces:
@@ -382,6 +382,8 @@ class DataLoader:
         result = pd.concat(all_surfaces, ignore_index=True).sort_values(['symbol', 'expiry', 'strike'])
         if use_cache and not result.empty:
             self._save_to_cache(result, cache_key)
+        if not result.empty:
+            print(f"Built volatility surface with {len(result)} points")
         return result
     
     def generate_synthetic_positions(self, symbols: List[str], num_positions: int = 20, seed: Optional[int] = None) -> pd.DataFrame:
@@ -509,6 +511,7 @@ class DataLoader:
         """
         filepath = os.path.join(self.data_dir, filename)
         data.to_csv(filepath, index=False)
+        print(f"Saved {filename} ({len(data)} rows)")
         
         if metadata:
             metadata_file = os.path.join(self.data_dir, "metadata.json")
@@ -532,3 +535,71 @@ class DataLoader:
         """
         filepath = os.path.join(self.data_dir, filename)
         return pd.read_csv(filepath)
+    
+    def load_all_data(self, symbols: List[str], num_positions: int = 20, 
+                     seed: Optional[int] = None, use_cache: bool = True,
+                     generate_positions: bool = True) -> Dict[str, pd.DataFrame]:
+        """
+        Do-it-all function: Fetches all required data and saves to expected file names.
+        
+        This function orchestrates the entire data loading pipeline:
+        1. Fetches stock market data → saves as 'market_data.csv'
+        2. Fetches risk-free rates → saves as 'rates.csv'
+        3. Builds volatility surface → saves as 'vol_surface.csv'
+        4. Generates synthetic positions → saves as 'positions.csv'
+        
+        Args:
+            symbols: List of stock symbols to fetch data for
+            num_positions: Number of synthetic positions to generate
+            seed: Random seed for position generation (for reproducibility)
+            use_cache: If True, use cached data when available
+            generate_positions: If True, generate synthetic positions; if False, skip
+        
+        Returns:
+            Dictionary with keys: 'market_data', 'rates', 'vol_surface', 'positions'
+            containing the respective DataFrames
+        
+        Raises:
+            ValueError: If required data cannot be fetched
+        """
+        print("Loading all required data")
+        results = {}
+        
+        # 1. Fetch and save market data
+        market_data = self.fetch_stock_data(symbols, use_cache=use_cache)
+        self.save_data(market_data, "market_data.csv", 
+                      metadata={'symbols': symbols, 'num_symbols': len(market_data)})
+        results['market_data'] = market_data
+        
+        # 2. Fetch and save risk-free rates
+        rates = self.fetch_risk_free_rates(use_cache=use_cache)
+        self.save_data(rates, "rates.csv", 
+                      metadata={'num_tenors': len(rates)})
+        results['rates'] = rates
+        
+        # 3. Build and save volatility surface
+        vol_surface = self.build_volatility_surface(symbols, use_cache=use_cache)
+        if not vol_surface.empty:
+            self.save_data(vol_surface, "vol_surface.csv",
+                          metadata={'symbols': symbols, 'num_points': len(vol_surface)})
+            results['vol_surface'] = vol_surface
+        else:
+            # Create empty file with correct columns
+            empty_vol = pd.DataFrame({'symbol': [], 'expiry': [], 'strike': [], 'moneyness': [], 'implied_vol': []})
+            self.save_data(empty_vol, "vol_surface.csv", metadata={'symbols': symbols, 'num_points': 0})
+            results['vol_surface'] = empty_vol
+        
+        # 4. Generate and save synthetic positions
+        if generate_positions:
+            print(f"Generating {num_positions} synthetic positions")
+            positions = self.generate_synthetic_positions(symbols, num_positions, seed)
+            self.save_data(positions, "positions.csv",
+                          metadata={'num_positions': len(positions), 'seed': seed})
+            results['positions'] = positions
+            print(f"Generated {len(positions)} positions")
+        else:
+            results['positions'] = None
+        
+        print("Data loading complete")
+        
+        return results
