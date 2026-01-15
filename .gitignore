@@ -38,6 +38,10 @@ data/*.csv
 data/*.json
 !data/.gitkeep
 
+# Cache files
+data/cache_*.csv
+data/cache_*_metadata.json
+
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 *.ipynb_checkpoints
