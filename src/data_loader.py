@@ -1,15 +1,3 @@
-"""
-Data Loader Module
-
-Purpose: Fetch real market data and generate synthetic positions.
-- Fetch Stock Data: Gets prices and dividends for selected symbols from Yahoo Finance
-- Fetch Risk-Free Rates: Gets latest Treasury rates from the Federal Reserve
-- Fetch Options Chain: Gets calls and puts with strikes, prices, volumes
-- Build Volatility Surface: Assembles implied vols across strikes and expiries
-- Generate Synthetic Positions: Creates a realistic portfolio (mix of stocks and options)
-- Generate Synthetic Borrow Costs: Produces plausible borrow costs when unavailable publicly
-"""
-
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
