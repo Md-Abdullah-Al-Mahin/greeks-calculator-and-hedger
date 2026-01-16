@@ -164,7 +164,7 @@ class DataLoader:
     
     def fetch_risk_free_rates(self, use_cache: bool = True) -> pd.DataFrame:
         """
-        Fetch latest Treasury rates from Federal Reserve (FRED).
+        Fetch latest Treasury rates from Federal Reserve (FRED) or yfinance fallback.
         
         Args:
             use_cache: If True, load from cache if available and valid
@@ -179,40 +179,81 @@ class DataLoader:
         
         print("Fetching risk-free rates")
         
-        if not HAS_DATAREADER or web is None:
-            raise ImportError("pandas-datareader is required. Install with: pip install pandas-datareader")
-        
-        # FRED series IDs for Treasury rates
-        fred_series = {
-            30: 'DGS1MO',      # 1 month
-            90: 'DGS3MO',      # 3 months
-            180: 'DGS6MO',     # 6 months
-            365: 'DGS1',       # 1 year
-            730: 'DGS2',       # 2 years
-            1095: 'DGS3',      # 3 years
-            1825: 'DGS5',      # 5 years
-            2555: 'DGS7',      # 7 years
-            3650: 'DGS10',     # 10 years
-        }
-        
         results = []
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=5)
         
-        for tenor_days, series_id in fred_series.items():
-            try:
-                data = web.DataReader(series_id, 'fred', start_date, end_date)
-                if not data.empty:
-                    rate = data[series_id].dropna().iloc[-1] / 100  # Convert to decimal
-                    results.append({
-                        'tenor_days': tenor_days,
-                        'rate': float(rate)
-                    })
-            except Exception:
-                continue
+        # Try FRED via pandas-datareader first
+        if HAS_DATAREADER and web is not None:
+            fred_series = {
+                30: 'DGS1MO',      # 1 month
+                90: 'DGS3MO',      # 3 months
+                180: 'DGS6MO',     # 6 months
+                365: 'DGS1',       # 1 year
+                730: 'DGS2',       # 2 years
+                1095: 'DGS3',      # 3 years
+                1825: 'DGS5',      # 5 years
+                2555: 'DGS7',      # 7 years
+                3650: 'DGS10',     # 10 years
+            }
+            
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=5)
+            
+            for tenor_days, series_id in fred_series.items():
+                try:
+                    data = web.DataReader(series_id, 'fred', start_date, end_date)
+                    if not data.empty:
+                        rate = data[series_id].dropna().iloc[-1] / 100  # Convert to decimal
+                        results.append({
+                            'tenor_days': tenor_days,
+                            'rate': float(rate)
+                        })
+                except Exception:
+                    continue
         
+        # Fallback to yfinance if FRED failed or pandas-datareader unavailable
         if not results:
-            raise ValueError("No Treasury rates could be fetched. Please check your internet connection.")
+            print("Using yfinance fallback for Treasury rates")
+            # yfinance tickers for Treasury rates
+            yf_tickers = {
+                30: '^IRX',    # 13-week (closest to 1 month)
+                90: '^IRX',    # 13-week (closest to 3 months)
+                180: '^IRX',   # 13-week (closest to 6 months)
+                365: '^IRX',   # 13-week (closest to 1 year)
+                730: '^FVX',  # 5-year (closest to 2 years)
+                1095: '^FVX', # 5-year (closest to 3 years)
+                1825: '^FVX', # 5-year
+                2555: '^FVX', # 5-year (closest to 7 years)
+                3650: '^TNX', # 10-year
+            }
+            
+            for tenor_days, ticker_symbol in yf_tickers.items():
+                try:
+                    ticker = yf.Ticker(ticker_symbol)
+                    hist = ticker.history(period='5d')
+                    if not hist.empty:
+                        rate = hist['Close'].iloc[-1] / 100  # Convert to decimal
+                        results.append({
+                            'tenor_days': tenor_days,
+                            'rate': float(rate)
+                        })
+                except Exception:
+                    continue
+        
+        # If still no results, use reasonable defaults
+        if not results:
+            print("Warning: Could not fetch Treasury rates. Using default rates.")
+            defaults = {
+                30: 0.045,   # 4.5% for short-term
+                90: 0.045,
+                180: 0.045,
+                365: 0.047,  # 4.7% for 1 year
+                730: 0.048,  # 4.8% for 2 years
+                1095: 0.049, # 4.9% for 3 years
+                1825: 0.050, # 5.0% for 5 years
+                2555: 0.051, # 5.1% for 7 years
+                3650: 0.052, # 5.2% for 10 years
+            }
+            results = [{'tenor_days': k, 'rate': v} for k, v in defaults.items()]
         
         df = pd.DataFrame(results).sort_values('tenor_days')
         if use_cache:

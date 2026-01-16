@@ -1,16 +1,3 @@
-"""
-Greeks Calculator Module
-
-Purpose: Compute Black-Scholes greeks for each position.
-- Load Data: Reads CSVs into memory; validates schema
-- Compute Time to Expiry: Converts expiry dates to year fractions
-- Interpolate Interest Rate: Estimates rate for any time horizon
-- Interpolate Volatility: Estimates implied vol for a given strike and expiry
-- Compute Black-Scholes Greeks: Calculates delta, gamma, vega, theta, rho for options
-- Enrich Positions: Joins positions with market inputs and derived fields
-- Compute Position Greeks: Applies greeks to every position
-"""
-
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -21,7 +8,7 @@ import os
 
 class GreeksCalculator:
     """
-    Runs the full pipeline and provides basic validation checks.
+    Computes Black-Scholes greeks for positions.
     """
     
     def __init__(self, data_dir: str = "data"):
@@ -51,43 +38,293 @@ class GreeksCalculator:
     def interpolate_interest_rate(self, time_to_expiry: float, rates: pd.DataFrame) -> float:
         """
         Interpolate interest rate for given time horizon.
+        
+        Args:
+            time_to_expiry: Time to expiry in years (float)
+            rates: DataFrame with columns 'tenor_days' and 'rate' (decimal)
+        
+        Returns:
+            Interpolated interest rate (decimal)
+        
+        Notes:
+            - Uses linear interpolation between tenor points
+            - If time_to_expiry is before the first tenor, returns the first rate
+            - If time_to_expiry is after the last tenor, returns the last rate
         """
-        # TODO: Implement linear or cubic interpolation
-        pass
+        if rates.empty:
+            raise ValueError("Rates DataFrame is empty")
+        
+        # Convert time_to_expiry from years to days
+        time_to_expiry_days = time_to_expiry * 365.0
+        
+        # Ensure rates are sorted by tenor_days
+        rates_sorted = rates.sort_values('tenor_days').copy()
+        
+        # Extract tenor_days and rates as numpy arrays
+        tenor_days = np.array(rates_sorted['tenor_days'].values, dtype=float)
+        rate_values = np.array(rates_sorted['rate'].values, dtype=float)
+        
+        # Handle edge cases
+        if time_to_expiry_days <= tenor_days[0]:
+            # Before first tenor: return first rate
+            return float(rate_values[0])
+        elif time_to_expiry_days >= tenor_days[-1]:
+            # After last tenor: return last rate
+            return float(rate_values[-1])
+        else:
+            # Linear interpolation using numpy
+            interpolated_rate = np.interp(time_to_expiry_days, tenor_days, rate_values)
+            return float(interpolated_rate)
     
     def interpolate_volatility(self, symbol: str, strike: float, expiry: datetime, 
                               spot_price: float, vol_surface: pd.DataFrame) -> float:
         """
         Interpolate implied volatility from surface.
+        
+        Args:
+            symbol: Stock symbol (e.g., 'AAPL')
+            strike: Strike price of the option
+            expiry: Expiry date as datetime
+            spot_price: Current spot price of the underlying
+            vol_surface: DataFrame with columns 'symbol', 'expiry', 'strike', 'moneyness', 'implied_vol'
+        
+        Returns:
+            Interpolated implied volatility (decimal, e.g., 0.25 for 25%)
+        
+        Notes:
+            - First filters by symbol
+            - Finds the closest expiry date in the surface
+            - Interpolates based on strike for that expiry
+            - Falls back to default volatility (0.25) if no data found
         """
-        # TODO: Implement volatility interpolation
-        pass
+        DEFAULT_VOL = 0.25
+        
+        if vol_surface.empty:
+            return DEFAULT_VOL
+        
+        # Filter by symbol and convert expiry to datetime
+        symbol_data = vol_surface[vol_surface['symbol'] == symbol].copy()
+        if symbol_data.empty:
+            return DEFAULT_VOL
+        
+        symbol_data['expiry'] = pd.to_datetime(symbol_data['expiry'])
+        
+        # Find closest expiry
+        expiry_ts = pd.Timestamp(expiry)
+        unique_expiries = pd.Series(symbol_data['expiry']).drop_duplicates().tolist()
+        if not unique_expiries:
+            return DEFAULT_VOL
+        
+        time_diffs = [abs((pd.Timestamp(exp) - expiry_ts).total_seconds()) for exp in unique_expiries]
+        closest_expiry = pd.Timestamp(unique_expiries[np.argmin(time_diffs)])
+        
+        # Filter by closest expiry, valid vols, and sort by strike
+        expiry_data = pd.DataFrame(
+            symbol_data[(symbol_data['expiry'] == closest_expiry) & (symbol_data['implied_vol'] > 0)]
+        ).sort_values('strike')
+        
+        if expiry_data.empty:
+            return DEFAULT_VOL
+        
+        # Extract arrays and interpolate
+        strikes = expiry_data['strike'].values.astype(float)
+        vols = expiry_data['implied_vol'].values.astype(float)
+        
+        if strike <= strikes[0]:
+            return float(vols[0])
+        elif strike >= strikes[-1]:
+            return float(vols[-1])
+        else:
+            return float(np.interp(strike, strikes, vols))        
     
     def compute_black_scholes_greeks(self, spot: float, strike: float, time_to_expiry: float,
                                     rate: float, volatility: float, option_type: str) -> dict:
         """
         Compute Black-Scholes greeks for a single option.
         
+        Args:
+            spot: Current spot price of the underlying
+            strike: Strike price of the option
+            time_to_expiry: Time to expiry in years
+            rate: Risk-free interest rate (decimal)
+            volatility: Implied volatility (decimal)
+            option_type: 'call' or 'put'
+        
         Returns:
             Dictionary with delta, gamma, vega, theta, rho
         """
-        # TODO: Implement Black-Scholes greeks calculation
-        pass
+        # Handle edge cases
+        if time_to_expiry <= 0:
+            # Option expired
+            return {'delta': 0.0, 'gamma': 0.0, 'vega': 0.0, 'theta': 0.0, 'rho': 0.0}
+        
+        if volatility <= 0 or spot <= 0 or strike <= 0:
+            return {'delta': 0.0, 'gamma': 0.0, 'vega': 0.0, 'theta': 0.0, 'rho': 0.0}
+        
+        # Calculate d1 and d2
+        sqrt_T = np.sqrt(time_to_expiry)
+        d1 = (np.log(spot / strike) + (rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * sqrt_T)
+        d2 = d1 - volatility * sqrt_T
+        
+        # Standard normal CDF and PDF
+        N_d1 = norm.cdf(d1)
+        N_d2 = norm.cdf(d2)
+        N_neg_d1 = norm.cdf(-d1)
+        N_neg_d2 = norm.cdf(-d2)
+        n_d1 = norm.pdf(d1)  # PDF at d1
+        
+        # Discount factor
+        discount = np.exp(-rate * time_to_expiry)
+        
+        # Common terms
+        vega_term = spot * n_d1 * sqrt_T
+        gamma_term = n_d1 / (spot * volatility * sqrt_T)
+        theta_vol_term = -spot * n_d1 * volatility / (2 * sqrt_T)
+        
+        if option_type.lower() == 'call':
+            delta = N_d1
+            theta = theta_vol_term - rate * strike * discount * N_d2
+            rho = strike * time_to_expiry * discount * N_d2
+        else:  # put
+            delta = N_d1 - 1.0  # or -N_neg_d1
+            theta = theta_vol_term + rate * strike * discount * N_neg_d2
+            rho = -strike * time_to_expiry * discount * N_neg_d2
+        
+        # Gamma and Vega are the same for calls and puts
+        gamma = gamma_term
+        vega = vega_term
+        
+        return {
+            'delta': float(delta),
+            'gamma': float(gamma),
+            'vega': float(vega),
+            'theta': float(theta),
+            'rho': float(rho)
+        }
     
     def enrich_positions(self, positions: pd.DataFrame, market_data: pd.DataFrame,
                         rates: pd.DataFrame, vol_surface: pd.DataFrame) -> pd.DataFrame:
         """
         Join positions with market inputs and compute derived fields.
+        
+        Args:
+            positions: DataFrame with position_id, symbol, quantity, instrument_type, strike, expiry, option_type
+            market_data: DataFrame with symbol, spot_price, dividend_yield, borrow_cost_bps, last_updated
+            rates: DataFrame with tenor_days, rate
+            vol_surface: DataFrame with symbol, expiry, strike, moneyness, implied_vol
+        
+        Returns:
+            DataFrame with all original fields plus: spot_price, dividend_yield, borrow_cost_bps,
+            time_to_expiry, interpolated_rate, interpolated_vol
         """
-        # TODO: Implement position enrichment
-        pass
+        # Start with a copy of positions
+        enriched = positions.copy()
+        
+        # Join with market_data on symbol
+        enriched = enriched.merge(
+            market_data[['symbol', 'spot_price', 'dividend_yield', 'borrow_cost_bps']],
+            on='symbol',
+            how='left'
+        )
+        
+        # Initialize derived fields
+        enriched['time_to_expiry'] = 0.0
+        enriched['interpolated_rate'] = 0.0
+        enriched['interpolated_vol'] = 0.0
+        
+        # Get default short-term rate for equities
+        default_rate = 0.0
+        if not rates.empty:
+            short_rates = pd.DataFrame(rates[rates['tenor_days'] <= 30])
+            if not short_rates.empty:
+                default_rate = float(short_rates.iloc[0]['rate'])
+            else:
+                default_rate = float(pd.DataFrame(rates).iloc[0]['rate'])
+        
+        # Process options
+        option_mask = enriched['instrument_type'] == 'option'
+        if option_mask.any():
+            # Compute time to expiry for options
+            expiry_series = pd.Series(pd.to_datetime(enriched.loc[option_mask, 'expiry']))
+            time_to_expiry_series = self.compute_time_to_expiry(expiry_series)
+            enriched.loc[option_mask, 'time_to_expiry'] = time_to_expiry_series.values
+            
+            # Interpolate rates and vols for options
+            for idx in enriched[option_mask].index:
+                time_to_exp = enriched.at[idx, 'time_to_expiry']
+                if time_to_exp > 0:
+                    # Interpolate rate
+                    rate = self.interpolate_interest_rate(time_to_exp, rates)
+                    enriched.at[idx, 'interpolated_rate'] = rate
+                    
+                    # Interpolate volatility
+                    strike = float(enriched.at[idx, 'strike'])
+                    spot_price = float(enriched.at[idx, 'spot_price'])
+                    expiry_date = pd.to_datetime(enriched.at[idx, 'expiry'])
+                    vol = self.interpolate_volatility(
+                        enriched.at[idx, 'symbol'],
+                        strike,
+                        expiry_date,
+                        spot_price,
+                        vol_surface
+                    )
+                    enriched.at[idx, 'interpolated_vol'] = vol
+        
+        # Set default rate for equities
+        equity_mask = enriched['instrument_type'] == 'equity'
+        enriched.loc[equity_mask, 'interpolated_rate'] = default_rate
+        
+        return enriched
     
     def compute_position_greeks(self, enriched_positions: pd.DataFrame) -> pd.DataFrame:
         """
         Compute greeks for all positions (equities get delta=1, others computed).
+        
+        Args:
+            enriched_positions: DataFrame with enriched position data including spot_price,
+                              time_to_expiry, interpolated_rate, interpolated_vol
+        
+        Returns:
+            DataFrame with all original fields plus unit greeks (delta, gamma, vega, theta, rho)
+            and position greeks (position_delta, position_gamma, position_vega, position_theta, position_rho)
         """
-        # TODO: Implement position-level greeks computation
-        pass
+        positions = enriched_positions.copy()
+        
+        # Initialize unit greeks columns
+        positions['delta'] = 0.0
+        positions['gamma'] = 0.0
+        positions['vega'] = 0.0
+        positions['theta'] = 0.0
+        positions['rho'] = 0.0
+        
+        # Process equities: delta=1, other greeks=0
+        equity_mask = positions['instrument_type'] == 'equity'
+        positions.loc[equity_mask, 'delta'] = 1.0
+        
+        # Process options: compute Black-Scholes greeks
+        option_mask = positions['instrument_type'] == 'option'
+        for idx in positions[option_mask].index:
+            row = positions.loc[idx]
+            greeks = self.compute_black_scholes_greeks(
+                spot=float(row['spot_price']),
+                strike=float(row['strike']),
+                time_to_expiry=float(row['time_to_expiry']),
+                rate=float(row['interpolated_rate']),
+                volatility=float(row['interpolated_vol']),
+                option_type=str(row['option_type'])
+            )
+            positions.loc[idx, ['delta', 'gamma', 'vega', 'theta', 'rho']] = [
+                greeks['delta'], greeks['gamma'], greeks['vega'], greeks['theta'], greeks['rho']
+            ]
+        
+        # Compute position-level greeks (unit greeks * quantity)
+        positions['position_delta'] = positions['delta'] * positions['quantity']
+        positions['position_gamma'] = positions['gamma'] * positions['quantity']
+        positions['position_vega'] = positions['vega'] * positions['quantity']
+        positions['position_theta'] = positions['theta'] * positions['quantity']
+        positions['position_rho'] = positions['rho'] * positions['quantity']
+        
+        return positions
     
     def run_pipeline(self) -> pd.DataFrame:
         """
@@ -96,8 +333,11 @@ class GreeksCalculator:
         Returns:
             DataFrame with positions and their greeks
         """
-        # TODO: Implement full pipeline
-        pass
+        positions, market_data, rates, vol_surface = self.load_data()
+        enriched_positions = self.enrich_positions(positions, market_data, rates, vol_surface)
+        positions_with_greeks = self.compute_position_greeks(enriched_positions)
+        self.save_results(positions_with_greeks)
+        return positions_with_greeks
     
     def save_results(self, positions_with_greeks: pd.DataFrame):
         """
