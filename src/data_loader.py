@@ -57,6 +57,17 @@ class DataLoader:
             print(f"Warning: Could not load cache for {cache_key}: {str(e)}")
             return None
     
+    def load_treasury_etf_data(self) -> Optional[pd.DataFrame]:
+        """Load Treasury ETF data from permanent CSV file if it exists."""
+        filepath = os.path.join(self.data_dir, "treasury_etf_data.csv")
+        if os.path.exists(filepath):
+            try:
+                return pd.read_csv(filepath)
+            except Exception as e:
+                print(f"Warning: Could not load treasury_etf_data.csv: {str(e)}")
+                return None
+        return None
+    
     def _save_to_cache(self, data: pd.DataFrame, cache_key: str):
         """Save data to cache with metadata."""
         try:
@@ -111,6 +122,54 @@ class DataLoader:
         total = 10 + spread_factor + volume_factor + cap_factor + short_factor
         return round(max(5, min(total, 500)), 2)
     
+    def _estimate_transaction_cost_from_liquidity(self, info: Dict, spot_price: float) -> float:
+        """
+        Estimate transaction cost (in basis points) from liquidity metrics.
+        
+        Uses bid-ask spread, volume, and market cap.
+        Transaction cost represents the cost of executing a trade (one-way).
+        
+        Components:
+        - Bid-ask spread (primary): Half the spread as one-way cost
+        - Volume factor: Lower volume = higher market impact
+        - Market cap factor: Smaller cap = higher cost
+        - Base commission: Assumed institutional commission
+        """
+        # Bid-ask spread (primary component - one-way cost)
+        bid, ask = info.get('bid'), info.get('ask')
+        if bid and ask and bid > 0:
+            mid_price = (bid + ask) / 2
+            spread_bps = ((ask - bid) / mid_price) * 10000
+            spread_cost = min(spread_bps / 2, 50)  # One-way cost, cap at 50 bps
+        else:
+            spread_cost = 2.5  # Default spread cost (half of typical 5 bps spread)
+        
+        # Volume factor (lower volume = higher market impact)
+        avg_volume = info.get('averageVolume10days') or info.get('averageVolume', 0)
+        if avg_volume > 0:
+            # Logarithmic scaling: high volume = low cost
+            # For very high volume (>100M), cost approaches 0
+            # For low volume (<1M), cost increases significantly
+            volume_factor = max(0, 10 - np.log10(max(avg_volume, 1)) * 2)
+        else:
+            volume_factor = 10  # Default for unknown volume
+        
+        # Market cap factor (smaller cap = higher cost)
+        market_cap = info.get('marketCap', 0)
+        if market_cap >= 10e9:  # Large cap
+            cap_factor = 0
+        elif market_cap >= 1e9:  # Mid cap
+            cap_factor = 3
+        else:  # Small cap
+            cap_factor = 8
+        
+        # Base commission (assume 2 bps for institutional trading)
+        base_commission = 2.0
+        
+        # Total transaction cost
+        total = base_commission + spread_cost + volume_factor + cap_factor
+        return round(max(1, min(total, 100)), 2)  # Cap between 1-100 bps
+    
     def fetch_stock_data(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
         """
         Fetch stock prices and dividends from Yahoo Finance.
@@ -120,7 +179,8 @@ class DataLoader:
             use_cache: If True, load from cache if available and valid
         
         Returns:
-            DataFrame with columns: symbol, spot_price, dividend_yield, borrow_cost_bps, last_updated
+            DataFrame with columns: symbol, spot_price, dividend_yield, borrow_cost_bps, 
+                                  transaction_cost_bps, last_updated
         """
         cache_key = f"stock_data_{'_'.join(sorted(symbols))}"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
@@ -142,12 +202,14 @@ class DataLoader:
                 
                 dividend_yield = info.get('dividendYield') or 0.0
                 borrow_cost_bps = self._estimate_borrow_cost_from_liquidity(info, spot_price)
+                transaction_cost_bps = self._estimate_transaction_cost_from_liquidity(info, spot_price)
                 
                 results.append({
                     'symbol': symbol,
                     'spot_price': float(spot_price),
                     'dividend_yield': float(dividend_yield),
                     'borrow_cost_bps': float(borrow_cost_bps),
+                    'transaction_cost_bps': float(transaction_cost_bps),
                     'last_updated': current_time.isoformat()
                 })
             except Exception:
@@ -632,3 +694,95 @@ class DataLoader:
         print("Data loading complete")
         
         return results
+    
+    def fetch_treasury_etf_data(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
+        """
+        Fetch Treasury ETF data including price, yield, and duration information.
+        
+        Args:
+            symbols: List of Treasury ETF symbols (e.g., ['TLT', 'IEF', 'SHY'])
+            use_cache: If True, load from cache if available and valid
+        
+        Returns:
+            DataFrame with columns: symbol, spot_price, dividend_yield, borrow_cost_bps,
+                                  transaction_cost_bps, yield_to_maturity, duration_years, last_updated
+        """
+        cache_key = f"treasury_etf_data_{'_'.join(sorted(symbols))}"
+        if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
+            print(f"Using cached Treasury ETF data for {len(symbols)} symbols")
+            return cached
+        
+        print(f"Fetching Treasury ETF data for {len(symbols)} symbols")
+        results = []
+        current_time = datetime.now()
+        
+        # Duration mapping for Treasury ETFs (approximate, in years)
+        duration_map = {
+            'TLT': 17.5,  # iShares 20+ Year Treasury Bond ETF
+            'IEF': 7.5,   # iShares 7-10 Year Treasury Bond ETF
+            'SHY': 2.0,   # iShares 1-3 Year Treasury Bond ETF
+            'TBT': 17.5,  # ProShares UltraShort 20+ Year Treasury
+            'TBF': 17.5,  # ProShares Short 20+ Year Treasury
+            'IEI': 5.0,   # iShares 3-7 Year Treasury Bond ETF
+            'VGIT': 5.0,  # Vanguard Intermediate-Term Treasury ETF
+        }
+        
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.info
+                
+                spot_price = self._get_price(ticker, info)
+                if spot_price is None:
+                    continue
+                
+                dividend_yield = info.get('dividendYield') or 0.0
+                borrow_cost_bps = self._estimate_borrow_cost_from_liquidity(info, spot_price)
+                transaction_cost_bps = self._estimate_transaction_cost_from_liquidity(info, spot_price)
+                
+                # Get yield to maturity (30-day SEC yield or trailing yield)
+                yield_to_maturity = info.get('yield') or info.get('trailingAnnualDividendYield') or 0.0
+                if yield_to_maturity > 1.0:  # If in percentage form, convert to decimal
+                    yield_to_maturity = yield_to_maturity / 100.0
+                
+                # Get duration from mapping or estimate from yield
+                duration_years = duration_map.get(symbol)
+                if duration_years is None:
+                    # Estimate duration: longer maturity ETFs have higher duration
+                    # Rough approximation based on symbol characteristics
+                    if '20' in symbol.upper() or 'LONG' in symbol.upper():
+                        duration_years = 17.0
+                    elif '10' in symbol.upper() or '7' in symbol.upper():
+                        duration_years = 7.0
+                    elif '3' in symbol.upper() or '5' in symbol.upper():
+                        duration_years = 5.0
+                    elif '1' in symbol.upper() or 'SHORT' in symbol.upper():
+                        duration_years = 2.0
+                    else:
+                        duration_years = 5.0  # Default
+                
+                results.append({
+                    'symbol': symbol,
+                    'spot_price': float(spot_price),
+                    'dividend_yield': float(dividend_yield),
+                    'borrow_cost_bps': float(borrow_cost_bps),
+                    'transaction_cost_bps': float(transaction_cost_bps),
+                    'yield_to_maturity': float(yield_to_maturity),
+                    'duration_years': float(duration_years),
+                    'last_updated': current_time.isoformat()
+                })
+            except Exception as e:
+                print(f"Warning: Could not fetch data for {symbol}: {str(e)}")
+                continue
+        
+        if not results:
+            raise ValueError("No Treasury ETF data could be fetched. Please check your symbols and internet connection.")
+        
+        df = pd.DataFrame(results)
+        if use_cache:
+            self._save_to_cache(df, cache_key)
+        # Also save to permanent CSV file
+        self.save_data(df, "treasury_etf_data.csv", 
+                      metadata={'symbols': symbols, 'num_symbols': len(df)})
+        print(f"Fetched Treasury ETF data for {len(df)} symbols")
+        return df
