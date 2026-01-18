@@ -89,14 +89,38 @@ def render_sidebar():
     st.session_state.data_dir = data_dir
     
     st.sidebar.subheader("Data Loading")
-    symbols_input = st.sidebar.text_input(
-        "Symbols (comma-separated)", 
+    
+    # Display current symbols count
+    num_symbols = len(st.session_state.symbols)
+    st.sidebar.caption(f"Current: {num_symbols} symbol{'s' if num_symbols != 1 else ''}")
+    
+    # Use text_area for better multi-line support
+    symbols_input = st.sidebar.text_area(
+        "Symbols (comma or newline separated)", 
         value=",".join(st.session_state.symbols),
-        key="sidebar_symbols"
+        key="sidebar_symbols",
+        height=100,
+        help="Enter stock symbols separated by commas or new lines. Example: AAPL, MSFT, GOOGL"
     )
     
+    # Parse symbols (handle both comma and newline separators)
     if symbols_input:
-        st.session_state.symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+        # Replace newlines with commas, then split by comma
+        normalized_input = symbols_input.replace('\n', ',').replace(' ', ',')
+        symbols_list = normalized_input.split(',')
+        
+        # Clean and filter symbols
+        parsed_symbols = [s.strip().upper() for s in symbols_list if s.strip()]
+        st.session_state.symbols = parsed_symbols
+        
+        # Show parsed count
+        if len(parsed_symbols) != num_symbols:
+            st.sidebar.caption(f"✓ Parsed {len(parsed_symbols)} symbol{'s' if len(parsed_symbols) != 1 else ''}")
+    
+    # Display current symbols in an expandable section
+    if st.session_state.symbols:
+        with st.sidebar.expander(f"📋 View Symbols ({len(st.session_state.symbols)})", expanded=False):
+            st.write(", ".join(st.session_state.symbols))
     
     num_positions = st.sidebar.number_input(
         "Number of Positions", 
