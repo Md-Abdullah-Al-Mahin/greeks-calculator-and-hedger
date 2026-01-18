@@ -226,7 +226,7 @@ def render_portfolio_view():
                     'rho': '{:,.2f}',
                     'notional': '${:,.2f}',
                 }),
-                use_container_width=True,
+                width='stretch',
                 height=400
             )
         else:
@@ -245,7 +245,7 @@ def render_portfolio_view():
                     'rho': '{:,.2f}',
                     'notional': '${:,.2f}',
                 }),
-                use_container_width=True
+                width='stretch'
             )
         else:
             st.info("No instrument type breakdown available.")
@@ -255,7 +255,7 @@ def render_portfolio_view():
         top_risks = aggregator.load_and_identify_top_risks(top_n=10)
         if not top_risks.empty:
             # Select relevant columns for display
-            display_cols = ['position_id', 'symbol', 'instrument_type', 'quantity', 
+            display_cols = ['position_id', 'symbol', 'instrument_type', 'option_type', 'quantity', 
                           'position_delta', 'position_gamma', 'position_vega', 'position_theta', 'position_rho']
             available_cols = [col for col in display_cols if col in top_risks.columns]
             st.dataframe(
@@ -267,7 +267,7 @@ def render_portfolio_view():
                     'position_theta': '{:,.2f}',
                     'position_rho': '{:,.2f}',
                 }),
-                use_container_width=True,
+                width='stretch',
                 height=400
             )
         else:
@@ -417,7 +417,7 @@ def render_hedge_optimizer():
                         'delta_contribution': '{:,.2f}',
                         'rho_contribution': '{:,.2f}',
                     }),
-                    use_container_width=True,
+                    width='stretch',
                     height=400
                 )
                 
@@ -486,7 +486,7 @@ def render_risk_analytics():
                     'Change': '{:,.2f}',
                     'Change %': '{:.2f}%'
                 }),
-                use_container_width=True
+                width='stretch'
             )
             
             # Visual comparison

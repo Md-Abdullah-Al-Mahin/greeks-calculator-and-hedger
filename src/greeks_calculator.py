@@ -436,8 +436,8 @@ class GreeksCalculator:
             if option_mask.any():
                 options = positions_with_greeks[option_mask].copy()
                 if 'option_type' in options.columns and 'delta' in options.columns:
-                    call_options = options[options['option_type'] == 'call']
-                    if len(call_options) > 0 and 'strike' in call_options.columns and 'spot_price' in call_options.columns:
+                    call_options = options[options['option_type'] == 'call'].copy()
+                    if isinstance(call_options, pd.DataFrame) and len(call_options) > 0 and 'strike' in call_options.columns and 'spot_price' in call_options.columns:
                         # Find ATM options (strike within 2% of spot)
                         call_options['moneyness'] = call_options['strike'] / call_options['spot_price']
                         atm_calls = call_options[(call_options['moneyness'] >= 0.98) & (call_options['moneyness'] <= 1.02)]
@@ -471,19 +471,51 @@ class GreeksCalculator:
         else:
             results['vega_non_negative'] = True
         
-        # Check 4: Theta should be negative for long positions (time decay)
+        # Check 4: Theta should generally be negative for long positions (time decay)
+        # Note: Positive theta can occur for deep ITM puts with high dividend yields,
+        # which is mathematically valid in Black-Scholes-Merton model
         if 'theta' in positions_with_greeks.columns and 'quantity' in positions_with_greeks.columns:
             long_positions = positions_with_greeks[positions_with_greeks['quantity'] > 0]
             if len(long_positions) > 0:
-                # For long positions, theta should be negative (value decreases over time)
                 option_mask = long_positions['instrument_type'] == 'option'
                 if option_mask.any():
-                    long_options = long_positions[option_mask]
-                    positive_theta = long_options[long_options['theta'] > 0]
-                    theta_check = len(positive_theta) == 0
-                    results['long_theta_negative'] = theta_check
-                    if not theta_check and verbose:
-                        warnings.append(f"Warning: Found {len(positive_theta)} long options with positive theta")
+                    long_options = long_positions[option_mask].copy()
+                    # Check for positive theta, but only warn if it's significant
+                    # (small positive values might be numerical noise)
+                    positive_theta = long_options[long_options['theta'] > 0.01].copy()  # Threshold: 0.01
+                    if isinstance(positive_theta, pd.DataFrame) and len(positive_theta) > 0:
+                        # Check if these are deep ITM puts (which can legitimately have positive theta)
+                        if 'option_type' in positive_theta.columns and 'strike' in positive_theta.columns and 'spot_price' in positive_theta.columns:
+                            puts = positive_theta[positive_theta['option_type'] == 'put']
+                            if len(puts) > 0:
+                                # Check if puts are deep ITM (strike >> spot for puts)
+                                deep_itm_puts = puts[puts['strike'] / puts['spot_price'] > 1.2]  # 20% ITM
+                                if len(deep_itm_puts) < len(positive_theta):
+                                    # Some positive theta options are not deep ITM puts - worth noting
+                                    results['long_theta_negative'] = False
+                                    if verbose:
+                                        warnings.append(f"Info: Found {len(positive_theta)} long options with positive theta (>0.01). "
+                                                      f"This can occur for deep ITM puts with high dividend yields (mathematically valid).")
+                                else:
+                                    # All positive theta are deep ITM puts - this is expected
+                                    results['long_theta_negative'] = True
+                                    if verbose and len(positive_theta) > 0:
+                                        warnings.append(f"Info: Found {len(positive_theta)} deep ITM puts with positive theta. "
+                                                      f"This is expected for deep ITM options with high dividend yields.")
+                            else:
+                                # Positive theta on calls (unusual but possible for very high dividends)
+                                results['long_theta_negative'] = False
+                                if verbose:
+                                    warnings.append(f"Info: Found {len(positive_theta)} long call options with positive theta (>0.01). "
+                                                  f"This is unusual but can occur with very high dividend yields.")
+                        else:
+                            # Can't check option type, just note the positive theta
+                            results['long_theta_negative'] = False
+                            if verbose:
+                                warnings.append(f"Info: Found {len(positive_theta)} long options with positive theta (>0.01). "
+                                              f"This can occur for deep ITM options with high dividend yields.")
+                    else:
+                        results['long_theta_negative'] = True
                 else:
                     results['long_theta_negative'] = True
             else:

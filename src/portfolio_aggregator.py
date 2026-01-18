@@ -206,7 +206,7 @@ class PortfolioAggregator:
             return pd.DataFrame()
         
         # Select relevant columns for top risks
-        risk_cols = ['position_id', 'symbol', 'instrument_type', 'quantity', 
+        risk_cols = ['position_id', 'symbol', 'instrument_type', 'option_type', 'quantity', 
                      'position_delta', 'position_gamma', 'position_vega', 
                      'position_theta', 'position_rho']
         
