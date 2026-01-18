@@ -61,8 +61,8 @@ def initialize_session_state():
         'greeks_calculated': False,
         'optimization_complete': False,
         'data_dir': DEFAULT_DATA_DIR,
-        'symbols': ['AAPL', 'MSFT', 'GOOGL', 'SPY'],
-        'num_positions': 20,
+        'symbols': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'SPY', 'QQQ', 'DIA', 'IWM'],
+        'num_positions': 50,
         'portfolio_exposures': None,
         'hedge_recommendations': None,
         'optimization_summary': None,
@@ -173,6 +173,138 @@ def render_sidebar():
     
     status_icon = "✅" if st.session_state.greeks_calculated else "❌"
     st.sidebar.write(f"{status_icon} Greeks Calculated")
+
+
+def render_positions_view():
+    """Render all positions in a table."""
+    st.header("📋 All Positions")
+    
+    if not st.session_state.greeks_calculated:
+        st.warning("⚠️ Please calculate greeks first using the sidebar controls.")
+        return
+    
+    try:
+        data_dir = get_data_dir()
+        aggregator = PortfolioAggregator(data_dir=data_dir)
+        
+        # Load positions with greeks
+        positions = aggregator.load_positions_with_greeks()
+        
+        if positions.empty:
+            st.info("No positions found.")
+            return
+        
+        # Display summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Positions", len(positions))
+        with col2:
+            equity_count = len(positions[positions['instrument_type'] == 'equity']) if 'instrument_type' in positions.columns else 0
+            st.metric("Equities", equity_count)
+        with col3:
+            option_count = len(positions[positions['instrument_type'] == 'option']) if 'instrument_type' in positions.columns else 0
+            st.metric("Options", option_count)
+        with col4:
+            unique_symbols = positions['symbol'].nunique() if 'symbol' in positions.columns else 0
+            st.metric("Unique Symbols", unique_symbols)
+        
+        # Filter options
+        st.subheader("Filters")
+        filter_col1, filter_col2, filter_col3 = st.columns(3)
+        
+        with filter_col1:
+            all_symbols = ['All'] + sorted(positions['symbol'].unique().tolist()) if 'symbol' in positions.columns else ['All']
+            selected_symbol = st.selectbox("Symbol", all_symbols, key="positions_filter_symbol")
+        
+        with filter_col2:
+            all_types = ['All'] + sorted(positions['instrument_type'].unique().tolist()) if 'instrument_type' in positions.columns else ['All']
+            selected_type = st.selectbox("Instrument Type", all_types, key="positions_filter_type")
+        
+        with filter_col3:
+            search_term = st.text_input("Search Position ID", "", key="positions_search")
+        
+        # Apply filters
+        filtered_positions = positions.copy()
+        
+        if selected_symbol != 'All':
+            filtered_positions = filtered_positions[filtered_positions['symbol'] == selected_symbol]
+        
+        if selected_type != 'All':
+            filtered_positions = filtered_positions[filtered_positions['instrument_type'] == selected_type]
+        
+        if search_term:
+            if 'position_id' in filtered_positions.columns:
+                filtered_positions = filtered_positions[
+                    filtered_positions['position_id'].str.contains(search_term, case=False, na=False)
+                ]
+        
+        # Select columns to display
+        base_cols = ['position_id', 'symbol', 'instrument_type', 'quantity']
+        option_cols = ['strike', 'expiry', 'option_type']
+        market_cols = ['spot_price', 'dividend_yield']
+        greek_cols = ['delta', 'gamma', 'vega', 'theta', 'rho']
+        position_greek_cols = ['position_delta', 'position_gamma', 'position_vega', 'position_theta', 'position_rho']
+        
+        display_cols = base_cols.copy()
+        
+        # Add option-specific columns if any options exist
+        if 'instrument_type' in filtered_positions.columns and (filtered_positions['instrument_type'] == 'option').any():
+            display_cols.extend([col for col in option_cols if col in filtered_positions.columns])
+        
+        # Add market data columns
+        display_cols.extend([col for col in market_cols if col in filtered_positions.columns])
+        
+        # Add greeks columns
+        display_cols.extend([col for col in greek_cols if col in filtered_positions.columns])
+        display_cols.extend([col for col in position_greek_cols if col in filtered_positions.columns])
+        
+        # Filter to only existing columns
+        available_cols = [col for col in display_cols if col in filtered_positions.columns]
+        
+        # Display table
+        st.subheader(f"Positions ({len(filtered_positions)} of {len(positions)})")
+        
+        if not filtered_positions.empty:
+            # Format the dataframe for display
+            display_df = filtered_positions[available_cols].copy()
+            
+            # Format numeric columns
+            format_dict = {}
+            for col in display_df.columns:
+                if col in ['quantity', 'strike', 'spot_price']:
+                    format_dict[col] = '{:,.2f}'
+                elif col in ['dividend_yield']:
+                    format_dict[col] = '{:.4f}'
+                elif col in ['delta', 'gamma', 'vega', 'theta', 'rho']:
+                    format_dict[col] = '{:,.4f}'
+                elif col in position_greek_cols:
+                    format_dict[col] = '{:,.2f}'
+                elif col in ['position_id']:
+                    format_dict[col] = '{}'
+            
+            st.dataframe(
+                display_df.style.format(format_dict),
+                width='stretch',
+                height=600
+            )
+            
+            # Download button
+            csv = filtered_positions.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Filtered Positions CSV",
+                data=csv,
+                file_name=f"positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_positions"
+            )
+        else:
+            st.info("No positions match the selected filters.")
+            
+    except FileNotFoundError as e:
+        st.error(f"❌ Positions file not found: {str(e)}")
+    except Exception as e:
+        st.error(f"❌ Error loading positions: {str(e)}")
+        st.exception(e)
 
 
 def render_portfolio_view():
@@ -321,7 +453,7 @@ def render_hedge_optimizer():
         # Hedge universe configuration
         with st.expander("Hedge Universe Configuration"):
             include_etfs = st.checkbox("Include ETFs", value=True, key="hedge_include_etfs")
-            etf_symbols_input = st.text_input("ETF Symbols (comma-separated)", value="SPY", key="hedge_etf_symbols")
+            etf_symbols_input = st.text_input("ETF Symbols (comma-separated)", value="SPY,QQQ,DIA,IWM", key="hedge_etf_symbols")
             include_ir = st.checkbox("Include Interest Rate Instruments (Treasury ETFs)", value=True, key="hedge_include_ir")
             treasury_symbols_input = st.text_input("Treasury Symbols (comma-separated)", value="TLT,IEF,SHY", key="hedge_treasury_symbols")
             
@@ -337,7 +469,7 @@ def render_hedge_optimizer():
         
         hedge_config = {
             'include_etfs': include_etfs,
-            'etf_symbols': [s.strip().upper() for s in etf_symbols_input.split(",") if s.strip()] if etf_symbols_input else ['SPY'],
+            'etf_symbols': [s.strip().upper() for s in etf_symbols_input.split(",") if s.strip()] if etf_symbols_input else ['SPY', 'QQQ', 'DIA', 'IWM'],
             'include_ir_instruments': include_ir,
             'treasury_symbols': [s.strip().upper() for s in treasury_symbols_input.split(",") if s.strip()] if treasury_symbols_input else [],
             'default_transaction_cost_bps': default_transaction_cost,
@@ -536,7 +668,7 @@ def render_settings():
     st.subheader("Default Hedge Universe")
     st.write("Configure default hedge universe settings:")
     
-    default_etf_symbols = st.text_input("Default ETF Symbols", value="SPY", key="settings_etf_symbols")
+    default_etf_symbols = st.text_input("Default ETF Symbols", value="SPY,QQQ,DIA,IWM", key="settings_etf_symbols")
     default_treasury_symbols = st.text_input("Default Treasury Symbols", value="TLT,IEF,SHY", key="settings_treasury_symbols")
     default_transaction_cost = st.number_input("Default Transaction Cost (bps)", value=5.0, step=0.1, key="settings_transaction_cost")
     default_max_quantity = st.number_input("Default Max Quantity", value=100000.0, step=1000.0, key="settings_max_quantity")
@@ -568,18 +700,21 @@ def main():
     render_sidebar()
     
     # Main tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Portfolio", "🛡️ Hedge Optimizer", "📊 Risk Analytics", "⚙️ Settings"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Positions", "📈 Portfolio", "🛡️ Hedge Optimizer", "📊 Risk Analytics", "⚙️ Settings"])
     
     with tab1:
-        render_portfolio_view()
+        render_positions_view()
     
     with tab2:
-        render_hedge_optimizer()
+        render_portfolio_view()
     
     with tab3:
-        render_risk_analytics()
+        render_hedge_optimizer()
     
     with tab4:
+        render_risk_analytics()
+    
+    with tab5:
         render_settings()
 
 

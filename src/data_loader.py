@@ -190,6 +190,7 @@ class DataLoader:
         
         print(f"Fetching stock data for {len(symbols)} symbols")
         results = []
+        failed_symbols = []
         current_time = datetime.now()
         
         for symbol in symbols:
@@ -199,6 +200,7 @@ class DataLoader:
                 
                 spot_price = self._get_price(ticker, info)
                 if spot_price is None:
+                    failed_symbols.append(f"{symbol} (no price data)")
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
@@ -214,11 +216,19 @@ class DataLoader:
                     'last_updated': current_time.isoformat()
                 })
             except (AttributeError, KeyError, ValueError, TypeError) as e:
-                # Skip symbols that fail to fetch - log if needed
+                failed_symbols.append(f"{symbol} ({str(e)})")
+                continue
+            except Exception as e:
+                # Catch any other unexpected errors
+                failed_symbols.append(f"{symbol} (unexpected error: {str(e)})")
                 continue
         
+        # Report failed symbols if any
+        if failed_symbols:
+            print(f"Warning: Failed to fetch data for {len(failed_symbols)} symbol(s): {', '.join(failed_symbols)}")
+        
         if not results:
-            raise ValueError("No stock data could be fetched. Please check your symbols and internet connection.")
+            raise ValueError(f"No stock data could be fetched for any symbols. Failed symbols: {', '.join(failed_symbols) if failed_symbols else 'all symbols'}. Please check your symbols and internet connection.")
         
         df = pd.DataFrame(results)
         if use_cache:
@@ -418,12 +428,14 @@ class DataLoader:
         print(f"Building volatility surface for {len(symbols)} symbols")
         
         all_surfaces = []
+        failed_symbols = []
         
         # Get spot prices for all symbols
         try:
             market_data = self.fetch_stock_data(symbols)
             spot_prices = dict(zip(market_data['symbol'], market_data['spot_price']))
-        except (KeyError, ValueError, AttributeError):
+        except (KeyError, ValueError, AttributeError) as e:
+            print(f"Warning: Could not fetch market data for volatility surface: {str(e)}")
             spot_prices = {}
         
         for symbol in symbols:
@@ -432,11 +444,13 @@ class DataLoader:
                 options_df = self.fetch_options_chain(symbol)
                 
                 if options_df.empty:
+                    failed_symbols.append(f"{symbol} (no options data)")
                     continue
                 
                 # Get spot price
                 spot_price = spot_prices.get(symbol)                
                 if spot_price is None or spot_price <= 0:
+                    failed_symbols.append(f"{symbol} (invalid spot price)")
                     continue
                 
                 # Calculate moneyness (strike / spot)
@@ -448,6 +462,10 @@ class DataLoader:
                     # Filter out invalid implied vols
                     valid_iv = options_df['impliedVolatility'].notna() & (options_df['impliedVolatility'] > 0)
                     options_df = options_df[valid_iv].copy()
+                    
+                    if options_df.empty:
+                        failed_symbols.append(f"{symbol} (no valid implied volatility)")
+                        continue
                     
                     # Select required columns and create new DataFrame with renamed column
                     surface_df = pd.DataFrame({
@@ -464,10 +482,23 @@ class DataLoader:
                         (surface_df['moneyness'] <= 2.0)
                     ]
                     
-                    all_surfaces.append(surface_df)
+                    if not surface_df.empty:
+                        all_surfaces.append(surface_df)
+                    else:
+                        failed_symbols.append(f"{symbol} (no options in moneyness range)")
+                else:
+                    failed_symbols.append(f"{symbol} (no implied volatility column)")
                     
-            except (KeyError, ValueError, AttributeError, TypeError):
+            except (KeyError, ValueError, AttributeError, TypeError) as e:
+                failed_symbols.append(f"{symbol} (error: {str(e)})")
                 continue
+            except Exception as e:
+                failed_symbols.append(f"{symbol} (unexpected error: {str(e)})")
+                continue
+        
+        # Report failed symbols if any
+        if failed_symbols:
+            print(f"Warning: Could not build volatility surface for {len(failed_symbols)} symbol(s): {', '.join(failed_symbols[:10])}{'...' if len(failed_symbols) > 10 else ''}")
         
         if not all_surfaces:
             return pd.DataFrame({'symbol': [], 'expiry': [], 'strike': [], 'moneyness': [], 'implied_vol': []})
@@ -716,6 +747,7 @@ class DataLoader:
         
         print(f"Fetching Treasury ETF data for {len(symbols)} symbols")
         results = []
+        failed_symbols = []
         current_time = datetime.now()
         
         # Duration mapping for Treasury ETFs (approximate, in years)
@@ -736,6 +768,7 @@ class DataLoader:
                 
                 spot_price = self._get_price(ticker, info)
                 if spot_price is None:
+                    failed_symbols.append(f"{symbol} (no price data)")
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
@@ -774,11 +807,16 @@ class DataLoader:
                     'last_updated': current_time.isoformat()
                 })
             except Exception as e:
+                failed_symbols.append(f"{symbol} ({str(e)})")
                 print(f"Warning: Could not fetch data for {symbol}: {str(e)}")
                 continue
         
+        # Report failed symbols if any
+        if failed_symbols:
+            print(f"Warning: Failed to fetch Treasury ETF data for {len(failed_symbols)} symbol(s): {', '.join(failed_symbols)}")
+        
         if not results:
-            raise ValueError("No Treasury ETF data could be fetched. Please check your symbols and internet connection.")
+            raise ValueError(f"No Treasury ETF data could be fetched. Failed symbols: {', '.join(failed_symbols) if failed_symbols else 'all symbols'}. Please check your symbols and internet connection.")
         
         df = pd.DataFrame(results)
         if use_cache:
