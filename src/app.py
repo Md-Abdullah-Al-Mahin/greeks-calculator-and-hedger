@@ -34,6 +34,7 @@ try:
     from greeks_calculator import GreeksCalculator
     from portfolio_aggregator import PortfolioAggregator
     from hedge_optimizer import HedgeOptimizer
+    from scenario_analyzer import ScenarioAnalyzer
 except ImportError:
     try:
         # Strategy 2: Relative imports (when running as package)
@@ -41,12 +42,14 @@ except ImportError:
         from .greeks_calculator import GreeksCalculator  # type: ignore
         from .portfolio_aggregator import PortfolioAggregator  # type: ignore
         from .hedge_optimizer import HedgeOptimizer  # type: ignore
+        from .scenario_analyzer import ScenarioAnalyzer  # type: ignore
     except ImportError:
         # Strategy 3: Try again with direct imports (parent dir now in path)
         from data_loader import DataLoader  # type: ignore
         from greeks_calculator import GreeksCalculator  # type: ignore
         from portfolio_aggregator import PortfolioAggregator  # type: ignore
         from hedge_optimizer import HedgeOptimizer  # type: ignore
+        from scenario_analyzer import ScenarioAnalyzer  # type: ignore
 
 
 # Default data directory
@@ -598,13 +601,14 @@ def render_risk_analytics():
     """Render risk analytics and scenario analysis."""
     st.header("📊 Risk Analytics")
     
-    if not st.session_state.optimization_complete:
-        st.warning("⚠️ Please run hedge optimization first to see analytics.")
+    if not st.session_state.greeks_calculated:
+        st.warning("⚠️ Please calculate greeks first to see analytics.")
         return
     
     try:
-        # Before/After Comparison
-        st.subheader("Before vs After Hedge")
+        # Before/After Comparison (only show if optimization was run)
+        if st.session_state.optimization_complete:
+            st.subheader("Before vs After Hedge")
         
         if st.session_state.original_exposures and st.session_state.optimization_summary:
             original = st.session_state.original_exposures
@@ -652,23 +656,167 @@ def render_risk_analytics():
             with col2:
                 st.metric("Rho Reduction", f"{abs(comparison_df.loc[1, 'Change']):,.2f}")
         
-        # Hedge Effectiveness Details
-        st.subheader("Hedge Effectiveness")
-        if st.session_state.optimization_summary:
-            summary = st.session_state.optimization_summary
-            effectiveness = summary['hedge_effectiveness_pct']
-            
-            st.progress(effectiveness / 100)
-            st.write(f"Hedge effectiveness: **{effectiveness:.1f}%**")
-            
-            if effectiveness >= 70:
-                st.success("✅ Hedge effectiveness meets target (≥70%)")
-            else:
-                st.warning(f"⚠️ Hedge effectiveness below target (current: {effectiveness:.1f}%)")
+        # Hedge Effectiveness Details (only show if optimization was run)
+        if st.session_state.optimization_complete:
+            st.subheader("Hedge Effectiveness")
+            if st.session_state.optimization_summary:
+                summary = st.session_state.optimization_summary
+                effectiveness = summary['hedge_effectiveness_pct']
+                
+                st.progress(effectiveness / 100)
+                st.write(f"Hedge effectiveness: **{effectiveness:.1f}%**")
+                
+                if effectiveness >= 70:
+                    st.success("✅ Hedge effectiveness meets target (≥70%)")
+                else:
+                    st.warning(f"⚠️ Hedge effectiveness below target (current: {effectiveness:.1f}%)")
         
-        # Scenario Analysis (placeholder for future enhancement)
+        st.markdown("---")
+        
+        # Scenario Analysis
         st.subheader("Scenario Analysis")
-        st.info("💡 Scenario analysis features coming soon. This will allow you to analyze portfolio behavior under different market conditions.")
+        st.write("Analyze portfolio performance under different market scenarios using greeks approximation.")
+        
+        try:
+            data_dir = get_data_dir()
+            analyzer = ScenarioAnalyzer(data_dir=data_dir)
+            
+            # Scenario inputs
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("#### Market Movement Scenarios")
+                price_change_pct = st.slider(
+                    "Price Change (%)",
+                    min_value=-50.0,
+                    max_value=50.0,
+                    value=0.0,
+                    step=0.5,
+                    key="scenario_price_change"
+                )
+                
+                vol_change_pct = st.slider(
+                    "Volatility Change (%)",
+                    min_value=-50.0,
+                    max_value=50.0,
+                    value=0.0,
+                    step=1.0,
+                    key="scenario_vol_change"
+                )
+            
+            with col2:
+                st.markdown("#### Interest Rate & Time Scenarios")
+                rate_change_bps = st.slider(
+                    "Interest Rate Change (basis points)",
+                    min_value=-200,
+                    max_value=200,
+                    value=0,
+                    step=10,
+                    key="scenario_rate_change"
+                )
+                
+                time_decay_days = st.slider(
+                    "Time Decay (days)",
+                    min_value=0,
+                    max_value=30,
+                    value=0,
+                    step=1,
+                    key="scenario_time_decay"
+                )
+            
+            # Calculate scenario P&L using ScenarioAnalyzer
+            scenario_results = analyzer.calculate_scenario_pnl(
+                price_change_pct=price_change_pct,
+                vol_change_pct=vol_change_pct,
+                rate_change_bps=rate_change_bps,
+                time_decay_days=time_decay_days
+            )
+            
+            # Extract results
+            total_pnl = scenario_results['total_pnl']
+            delta_pnl = scenario_results['delta_pnl']
+            gamma_pnl = scenario_results['gamma_pnl']
+            vega_pnl = scenario_results['vega_pnl']
+            theta_pnl = scenario_results['theta_pnl']
+            rho_pnl = scenario_results['rho_pnl']
+            portfolio_summary = scenario_results['portfolio_summary']
+            breakdown_df = scenario_results['breakdown']
+            
+            # Display results
+            st.markdown("---")
+            st.markdown("#### Scenario Results")
+            
+            # Summary metrics
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            
+            # Calculate P&L percentage
+            pnl_pct = analyzer.calculate_pnl_percentage(total_pnl, portfolio_summary['total_notional'])
+            pnl_delta = f"{pnl_pct:.2f}%" if pnl_pct is not None else "N/A"
+            
+            with col1:
+                st.metric("Total P&L", f"${total_pnl:,.2f}", delta=pnl_delta)
+            
+            with col2:
+                st.metric("Delta P&L", f"${delta_pnl:,.2f}")
+            
+            with col3:
+                st.metric("Gamma P&L", f"${gamma_pnl:,.2f}")
+            
+            with col4:
+                st.metric("Vega P&L", f"${vega_pnl:,.2f}")
+            
+            with col5:
+                st.metric("Theta P&L", f"${theta_pnl:,.2f}")
+            
+            with col6:
+                st.metric("Rho P&L", f"${rho_pnl:,.2f}")
+            
+            # Detailed breakdown
+            st.dataframe(
+                breakdown_df.style.format({
+                    'P&L ($)': '${:,.2f}'
+                }),
+                width='stretch',
+                height=300
+            )
+            
+            # Example scenarios
+            st.markdown("---")
+            st.markdown("#### Example Scenarios")
+            st.caption("Common scenario combinations to test:")
+            
+            example_col1, example_col2, example_col3 = st.columns(3)
+            
+            with example_col1:
+                st.markdown("**Bull Market**")
+                st.write("- Price: +10%")
+                st.write("- Vol: -5%")
+                st.write("- Time: 0 days")
+            
+            with example_col2:
+                st.markdown("**Bear Market**")
+                st.write("- Price: -10%")
+                st.write("- Vol: +20%")
+                st.write("- Time: 0 days")
+            
+            with example_col3:
+                st.markdown("**Time Decay**")
+                st.write("- Price: 0%")
+                st.write("- Vol: 0%")
+                st.write("- Time: 7-30 days")
+            
+            # Warning about limitations
+            st.info("""
+            **Note:** This analysis uses first-order (delta) and second-order (gamma) greeks approximation. 
+            For large moves (>20%), higher-order effects may become significant. 
+            Results assume linear relationships and may not capture all non-linear effects.
+            """)
+                
+            except FileNotFoundError:
+                st.error("❌ Positions with greeks not found. Please calculate greeks first.")
+            except Exception as e:
+                st.error(f"❌ Error in scenario analysis: {str(e)}")
+                st.exception(e)
         
     except Exception as e:
         st.error(f"❌ Error in risk analytics: {str(e)}")
