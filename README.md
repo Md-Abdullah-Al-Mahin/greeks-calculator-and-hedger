@@ -10,12 +10,13 @@ A Python-based system for calculating portfolio risk sensitivities (Greeks) and 
   - Synthetic where not publicly available: portfolio positions, borrow costs.
 - **Current Implementation Status**:
   - ✅ **Core Engine**: Fully implemented and functional
-    - Data loader with caching and Treasury ETF support
+    - Data loader with caching, Treasury ETF support, and error reporting for failed symbols
     - Greeks calculator with dividend-adjusted Black-Scholes model
+    - Portfolio aggregator for exposures, symbol/type breakdowns, and top risks
     - Hedge optimizer with Treasury bond/ETF support for rho hedging
+    - Scenario analyzer for P&L under market scenarios (greeks approximation)
     - Validation checks for greeks accuracy
-  - 🚧 **Dashboard UI**: Skeleton implemented (Streamlit), needs completion
-  - 🚧 **Portfolio Aggregator**: Structure defined, implementation pending
+  - ✅ **Dashboard UI**: Fully implemented (Streamlit) with Positions, Portfolio, Hedge Optimizer, Risk Analytics, and Settings tabs
 - **Deliverable**: Command-line and programmatic API that:
   - Loads data, computes greeks, aggregates exposures.
   - Optimizes hedges to meet targets.
@@ -42,6 +43,7 @@ This section describes components, responsibilities, inputs, outputs, and how da
     - Intelligent caching system with expiry-based cache management
     - Transaction cost estimation from liquidity metrics
     - Borrow cost estimation from market data
+    - **Error reporting**: Logs failed symbols with reasons (stock data, vol surface, Treasury ETF)
   - Inputs: List of stock symbols, settings (real vs synthetic), cache preferences.
   - Outputs: Positions table, market data table, rates table, volatility surface table, Treasury ETF data.
 
@@ -55,9 +57,9 @@ This section describes components, responsibilities, inputs, outputs, and how da
   - Inputs: Positions, market data, interest rates, volatility surface.
   - Outputs: Enriched positions with greeks (delta, gamma, vega, theta, rho) at position level.
 
-- **Portfolio Aggregator** 🚧 **Structure Defined, Implementation Pending**
+- **Portfolio Aggregator** ✅ **Fully Implemented**
   - Purpose: Summarize exposures at portfolio and symbol levels.
-  - Status: Class structure exists with method stubs; implementation needed.
+  - Features: Aggregate portfolio greeks, breakdown by symbol, breakdown by instrument type, identify top risks.
   - Inputs: Positions with greeks.
   - Outputs: Portfolio-level totals; breakdown by symbol and instrument type; top-risk positions list.
 
@@ -72,12 +74,18 @@ This section describes components, responsibilities, inputs, outputs, and how da
   - Inputs: Portfolio exposures, hedge universe configuration, market data, user targets.
   - Outputs: Hedge recommendations table (trades) and optimization summary (status, residual exposures, cost).
 
-- **Dashboard (UI)** 🚧 **Skeleton Implemented**
-  - Purpose: User interface to control data, view greeks, run optimizer, and download tickets.
-  - Status: Streamlit skeleton exists with placeholder functions; full implementation pending.
-  - Current Usage: System is primarily used via Python API/notebooks
-  - Inputs: All outputs above plus user inputs (targets, tolerances).
-  - Outputs: On-screen metrics and tables; downloadable CSV hedge tickets; simple reports.
+- **Scenario Analyzer** ✅ **Fully Implemented**
+  - Purpose: Calculate portfolio P&L under different market scenarios using greeks approximation.
+  - Formula: P&L ≈ Δ·ΔS + 0.5·Γ·(ΔS)² + ν·Δσ + θ·Δt + ρ·Δr
+  - Inputs: Portfolio greeks, scenario parameters (price change %, vol change %, rate change bps, time decay days).
+  - Outputs: P&L by component (delta, gamma, vega, theta, rho), breakdown table, P&L as % of notional.
+
+- **Dashboard (UI)** ✅ **Fully Implemented**
+  - Purpose: User interface to control data, view greeks, run optimizer, download tickets, and run scenario analysis.
+  - Tabs: **Positions** (all positions with filters, CSV download), **Portfolio** (greeks summary, symbol/type breakdowns, top risks), **Hedge Optimizer**, **Risk Analytics** (before/after hedge, hedge effectiveness, **Scenario Analysis**), **Settings**.
+  - Defaults: 11 symbols (AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, SPY, QQQ, DIA, IWM), 50 positions, ETFs (SPY, QQQ, DIA, IWM). Symbols input: text area, comma or newline separated.
+  - Inputs: All outputs above plus user inputs (targets, tolerances, scenario sliders).
+  - Outputs: On-screen metrics and tables; downloadable CSVs (positions, hedge tickets); scenario P&L results.
 
 ### 2.2 End-to-End Data Flow
 
@@ -86,7 +94,7 @@ This section describes components, responsibilities, inputs, outputs, and how da
 3. Greeks Calculator enriches positions with market inputs and computes greeks.
 4. Portfolio Aggregator summarizes exposures (portfolio totals, by symbol/type, top risks).
 5. User sets hedge targets; Hedge Optimizer recommends trades to meet targets.
-6. Dashboard displays recommendations; user downloads hedge tickets CSV.
+6. **Positions** tab: view/filter all positions, download CSV. **Portfolio** tab: greeks, breakdowns, top risks. **Risk Analytics**: before/after hedge, **Scenario Analysis** (P&L for price/vol/rate/time). User downloads hedge tickets CSV and optionally filtered positions CSV.
 
 ### 2.3 Architecture Diagram
 
@@ -111,10 +119,13 @@ graph TD
     D --> M
     M --> N[Hedge Recommendations]
     N --> O[CSV Export]
+    I --> Q[Scenario Analyzer]
+    Q --> R[Scenario P&L]
     J --> P[Dashboard Views]
     K --> P
     L --> P
     N --> P
+    R --> P
 ```
 
 ---
@@ -211,12 +222,18 @@ Use this as a step-by-step build guide and checklist.
     - Equity delta = 1.0
   - Greeks Engine Class: Runs the full pipeline and provides validation checks.
 
-- Portfolio Aggregator
+- Portfolio Aggregator ✅ **Fully Implemented**
   - Aggregate Portfolio Greeks: Sums all position greeks and calculates total notional.
   - Aggregate by Symbol: Groups exposures per stock symbol and sorts by largest risk.
   - Aggregate by Instrument Type: Splits equities vs. options to see source of risk.
   - Identify Top Risks: Lists largest individual positions by delta.
   - Portfolio Aggregator Class: Runs all aggregations and exports a summary report.
+
+- Scenario Analyzer ✅ **Fully Implemented**
+  - Calculate Scenario P&L: Uses greeks approximation P&L ≈ Δ·ΔS + 0.5·Γ·(ΔS)² + ν·Δσ + θ·Δt + ρ·Δr.
+  - Inputs: price change %, vol change %, rate change (bps), time decay (days); optionally pre-loaded portfolio summary and positions.
+  - Returns: total_pnl, delta_pnl, gamma_pnl, vega_pnl, theta_pnl, rho_pnl, breakdown DataFrame, portfolio_summary.
+  - Calculate P&L Percentage: P&L as % of notional.
 
 - Hedge Optimizer ✅ **Fully Implemented**
   - Build Hedge Universe: Builds the list of available hedge instruments with limits and costs.
@@ -231,13 +248,14 @@ Use this as a step-by-step build guide and checklist.
   - Compute Hedge Effectiveness: Reports how much risk was reduced (weighted average of delta and rho reduction).
   - Hedge Optimizer Class: Coordinates optimization, stores results, and exports hedge tickets.
 
-- Dashboard (UI)
-  - Initialize Session State: Sets up storage so data persists while clicking around.
-  - Render Sidebar: Controls for loading data, generating positions, and refreshing.
-  - Render Portfolio View: Shows greeks summary, breakdowns, and top risks visually.
-  - Render Hedge Optimizer: Accepts targets, runs optimization, shows trades, and offers CSV download.
-  - Render Risk Analytics: Compares before/after hedge exposures and simple scenario analysis.
-  - Render Settings: Edits hedge universe, solver settings, and data source mode (real vs synthetic).
+- Dashboard (UI) ✅ **Fully Implemented**
+  - Initialize Session State: Sets up storage; defaults: 11 symbols, 50 positions, data_dir.
+  - Render Sidebar: Data directory, **symbols text area** (comma/newline separated), number of positions, Use Cache, Load Data, Generate Positions, Calculate Greeks, status indicators, expandable "View Symbols".
+  - **Render Positions View** (Positions tab): All positions table with filters (symbol, instrument type, search), summary metrics, CSV download.
+  - Render Portfolio View: Greeks summary, symbol breakdown, instrument type breakdown, top 10 risks.
+  - Render Hedge Optimizer: Current exposures, hedge targets, hedge universe (ETFs: SPY, QQQ, DIA, IWM; Treasuries: TLT, IEF, SHY), Optimize button, results, hedge tickets CSV download.
+  - Render Risk Analytics: Before/after hedge comparison, hedge effectiveness; **Scenario Analysis** (sliders: price %, vol %, rate bps, time decay days; P&L by component, breakdown table, example scenarios).
+  - Render Settings: Data directory, cache, default ETF/Treasury symbols, solver settings, data source mode.
 
 ### 3.5 Repository Structure
 
@@ -256,11 +274,12 @@ Use this as a step-by-step build guide and checklist.
   - `metadata.json` - Timestamps, symbols, seed
   - `cache_*.csv` and `cache_*_metadata.json` - Cached data files
 - **src/**:
-  - `data_loader.py` ✅ - Real data integration + synthetic generators + caching
+  - `data_loader.py` ✅ - Real data integration + synthetic generators + caching + error reporting
   - `greeks_calculator.py` ✅ - Enrichment + greeks computation + validation
-  - `portfolio_aggregator.py` 🚧 - Structure defined, implementation pending
+  - `portfolio_aggregator.py` ✅ - Portfolio/symbol/type aggregation + top risks
   - `hedge_optimizer.py` ✅ - Hedge recommendations with Treasury support
-  - `app.py` 🚧 - Streamlit dashboard skeleton (needs completion)
+  - `scenario_analyzer.py` ✅ - Scenario P&L via greeks approximation
+  - `app.py` ✅ - Streamlit dashboard (Positions, Portfolio, Hedge Optimizer, Risk Analytics, Settings)
 - **tests/**:
   - `test_greeks.py` - Sanity checks (structure defined)
   - `test_optimizer.py` - Smoke tests (structure defined)
@@ -300,9 +319,23 @@ Use this as a step-by-step build guide and checklist.
 
 ### 3.7 Operating Guide (How to Use)
 
-**Current Usage (Python API/Notebooks):**
+**Dashboard (Primary):**
 
-The system is primarily used programmatically via Python scripts or Jupyter notebooks. Example workflow:
+Start the Streamlit dashboard:
+```bash
+streamlit run src/app.py
+```
+
+Workflow:
+1. Set **Data Directory** (e.g. `notebooks/data`). Enter **Symbols** (comma or newline separated; default: AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, SPY, QQQ, DIA, IWM). Set **Number of Positions** (default: 50).
+2. Click **Load Real-Time Data**, then **Generate Synthetic Positions**, then **Calculate Greeks**.
+3. **Positions** tab: View/filter all positions, download CSV.
+4. **Portfolio** tab: View greeks summary, symbol/type breakdowns, top risks.
+5. **Hedge Optimizer** tab: Set delta/rho targets and tolerances, configure hedge universe (ETFs: SPY, QQQ, DIA, IWM; Treasuries: TLT, IEF, SHY), click **Optimize Hedge**, download hedge tickets CSV.
+6. **Risk Analytics** tab: Before/after hedge, hedge effectiveness; **Scenario Analysis** (adjust price %, vol %, rate bps, time decay; view P&L by component).
+7. **Settings**: Data directory, cache, default symbols, solver options.
+
+**Python API / Notebooks:**
 
 ```python
 from src.data_loader import DataLoader
@@ -329,17 +362,16 @@ hedges, summary = optimizer.run_end_to_end(
 )
 ```
 
-**Dashboard (Future):**
+For programmatic scenario analysis:
+```python
+from src.scenario_analyzer import ScenarioAnalyzer
 
-When the Streamlit dashboard is fully implemented:
-- Start the dashboard: `streamlit run src/app.py`
-- Choose symbols and click "Load Real-Time Data."
-- Click "Generate Synthetic Positions" (choose quantity).
-- View "Portfolio Greeks" to inspect exposures.
-- Go to "Hedge Optimizer," set delta target (usually 0) and tolerance, then optimize.
-- Review trades and click "Download Hedge Tickets CSV."
-- Optionally, use "Risk Analytics" to compare before/after hedge scenarios.
-- Use "Settings" to adjust hedge universe and solver options.
+analyzer = ScenarioAnalyzer(data_dir="notebooks/data")
+results = analyzer.calculate_scenario_pnl(
+    price_change_pct=5.0, vol_change_pct=10.0, rate_change_bps=25, time_decay_days=7
+)
+# results: total_pnl, delta_pnl, gamma_pnl, vega_pnl, theta_pnl, rho_pnl, breakdown, portfolio_summary
+```
 
 ### 3.8 Acceptance Criteria (Checklist)
 
@@ -351,8 +383,8 @@ When the Streamlit dashboard is fully implemented:
 - ✅ Optimizer returns trades and reduces delta variance by ≥70%.
 - ✅ Hedge tickets CSV includes symbol, quantity, side, cost, contributions, timestamp.
 - ✅ **Smooth constraint formulation** improves optimization convergence.
-- 🚧 Aggregations match the sum of position-level exposures (Portfolio Aggregator pending).
-- 🚧 Dashboard UX: clear metrics, tables render, download works (Dashboard pending).
+- ✅ Portfolio Aggregator: aggregations match the sum of position-level exposures.
+- ✅ Dashboard: Positions view with filters and download; Portfolio, Hedge Optimizer, Risk Analytics (including Scenario Analysis), Settings; all metrics, tables, and CSV downloads work.
 
 ### 3.9 Risks and Contingencies
 
@@ -370,13 +402,17 @@ When the Streamlit dashboard is fully implemented:
 - ✅ **Smooth constraint formulation** for better optimization convergence
 - ✅ **Built-in validation checks** for greeks accuracy
 - ✅ **Intelligent caching system** with expiry-based cache management
+- ✅ **Portfolio Aggregator** fully implemented (aggregations, symbol/type breakdowns, top risks)
+- ✅ **Streamlit Dashboard** fully implemented: Positions (filters, CSV download), Portfolio, Hedge Optimizer, Risk Analytics, Settings
+- ✅ **Scenario Analyzer** (greeks-based P&L: Δ·ΔS + 0.5·Γ·(ΔS)² + ν·Δσ + θ·Δt + ρ·Δr); sliders for price %, vol %, rate bps, time decay
+- ✅ **Expanded defaults**: 11 symbols (AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, SPY, QQQ, DIA, IWM), 50 positions, ETFs (SPY, QQQ, DIA, IWM)
+- ✅ **Data loader error reporting**: failed-symbol logging for stock data, vol surface, Treasury ETF
+- ✅ **UI/UX**: symbols text area (comma/newline), View Symbols expander, Positions tab with filters
 
 **Future Extensions (Optional):**
 - Add gamma and vega constraints to optimizer.
 - Support index futures and options as hedge instruments.
 - Multi-currency support and FX rho (Garman–Kohlhagen model).
-- Complete Portfolio Aggregator implementation.
-- Complete Streamlit dashboard implementation.
 - Basic audit trail file with hashes and summaries.
 
 ---
@@ -399,9 +435,13 @@ When the Streamlit dashboard is fully implemented:
   - In: portfolio summary (from positions_with_greeks.csv), market_data.csv, hedge universe config, user targets.
   - Out: hedge_tickets.csv, optimization_summary.json
 
-- Dashboard (when implemented)
-  - In: all the above plus user controls.
-  - Out: visual metrics and tables, downloadable CSVs.
+- Scenario Analyzer
+  - In: positions_with_greeks.csv (or portfolio_summary + positions); scenario params: price_change_pct, vol_change_pct, rate_change_bps, time_decay_days.
+  - Out: total_pnl, component P&L (delta, gamma, vega, theta, rho), breakdown DataFrame, P&L % of notional.
+
+- Dashboard
+  - In: all the above plus user controls (symbols, positions count, targets, scenario sliders).
+  - Out: visual metrics and tables, downloadable CSVs (positions, hedge tickets).
 
 ---
 
@@ -410,22 +450,23 @@ When the Streamlit dashboard is fully implemented:
 ### ✅ Completed Components
 
 - **Core Engine**: Fully functional Python API
-  - Data loader with caching, Treasury ETF support, transaction cost estimation
+  - Data loader with caching, Treasury ETF support, transaction cost estimation, error reporting for failed symbols
   - Greeks calculator with dividend-adjusted Black-Scholes and validation
+  - Portfolio aggregator (portfolio/symbol/type aggregation, top risks)
   - Hedge optimizer with Treasury bond support and smooth constraints
+  - Scenario analyzer (greeks-based scenario P&L)
 - **CSV I/O**: All data files (positions, market data, rates, vol surface, Treasury ETFs, greeks, hedge tickets)
 - **Validation**: Built-in greeks validation and `greeks_validation.ipynb` notebook
+- **Streamlit Dashboard**: Positions, Portfolio, Hedge Optimizer, Risk Analytics (with Scenario Analysis), Settings
 - **Documentation**: This README with architecture and usage guide
 
 ### 🚧 Pending Components
 
-- **Portfolio Aggregator**: Structure defined, implementation needed
-- **Streamlit Dashboard**: Skeleton exists, full implementation needed
 - **Test Suite**: Structure defined, test implementations needed
 
 ### Usage
 
-The system is currently used via Python API/notebooks. See Section 3.7 for usage examples. The dashboard can be extended when needed.
+Primary: run `streamlit run src/app.py` and use the Dashboard. See Section 3.7 for the full workflow and Python API examples.
 
 ---
 
@@ -482,12 +523,17 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+Run the dashboard:
+```bash
+streamlit run src/app.py
+```
+
 Key dependencies:
 - pandas, numpy
 - scipy (for optimization)
 - yfinance (for market data)
 - pandas-datareader (for FRED rates, optional)
-- streamlit (for dashboard, when implemented)
+- streamlit (for dashboard)
 
 ### Data Directory
 
