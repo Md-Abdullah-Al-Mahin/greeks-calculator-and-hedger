@@ -44,7 +44,7 @@ class DataLoader:
                 metadata = json.load(f)
             cache_time = datetime.fromisoformat(metadata.get('timestamp', ''))
             return (datetime.now() - cache_time).total_seconds() < (self.cache_expiry_hours * 3600)
-        except Exception:
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, KeyError):
             return False
     
     def _load_from_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
@@ -53,7 +53,7 @@ class DataLoader:
             return None
         try:
             return pd.read_csv(self._get_cache_path(cache_key))
-        except Exception as e:
+        except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
             print(f"Warning: Could not load cache for {cache_key}: {str(e)}")
             return None
     
@@ -75,7 +75,8 @@ class DataLoader:
             metadata = {'timestamp': datetime.now().isoformat(), 'cache_key': cache_key, 'rows': len(data)}
             with open(self._get_cache_path(cache_key, metadata=True), 'w') as f:
                 json.dump(metadata, f, indent=2)
-        except Exception:
+        except (IOError, OSError, PermissionError):
+            # Silently fail on cache write errors - not critical
             pass
     
     def _get_price(self, ticker: yf.Ticker, info: Dict) -> Optional[float]:
@@ -86,7 +87,7 @@ class DataLoader:
                 hist = ticker.history(period='1d')
                 if not hist.empty:
                     price = hist['Close'].iloc[-1]
-            except Exception:
+            except (KeyError, IndexError, AttributeError):
                 pass
         return price
     
@@ -212,7 +213,8 @@ class DataLoader:
                     'transaction_cost_bps': float(transaction_cost_bps),
                     'last_updated': current_time.isoformat()
                 })
-            except Exception:
+            except (AttributeError, KeyError, ValueError, TypeError) as e:
+                # Skip symbols that fail to fetch - log if needed
                 continue
         
         if not results:
@@ -269,7 +271,7 @@ class DataLoader:
                             'tenor_days': tenor_days,
                             'rate': float(rate)
                         })
-                except Exception:
+                except (KeyError, IndexError, ValueError, AttributeError):
                     continue
         
         # Fallback to yfinance if FRED failed or pandas-datareader unavailable
@@ -298,7 +300,7 @@ class DataLoader:
                             'tenor_days': tenor_days,
                             'rate': float(rate)
                         })
-                except Exception:
+                except (KeyError, IndexError, ValueError, AttributeError):
                     continue
         
         # If still no results, use reasonable defaults
@@ -363,7 +365,7 @@ class DataLoader:
                             df_copy['expiry'] = expiry
                             df_copy['symbol'] = symbol
                             all_options.append(df_copy)
-                except Exception:
+                except (AttributeError, KeyError, ValueError):
                     continue
             
             if not all_options:
@@ -394,7 +396,7 @@ class DataLoader:
                 print(f"Fetched {len(df_result)} options for {symbol}")
             return df_result if isinstance(df_result, pd.DataFrame) else pd.DataFrame()
             
-        except Exception:
+        except (AttributeError, KeyError, ValueError, TypeError):
             return pd.DataFrame()
     
     def build_volatility_surface(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
@@ -421,7 +423,7 @@ class DataLoader:
         try:
             market_data = self.fetch_stock_data(symbols)
             spot_prices = dict(zip(market_data['symbol'], market_data['spot_price']))
-        except Exception:
+        except (KeyError, ValueError, AttributeError):
             spot_prices = {}
         
         for symbol in symbols:
@@ -464,7 +466,7 @@ class DataLoader:
                     
                     all_surfaces.append(surface_df)
                     
-            except Exception:
+            except (KeyError, ValueError, AttributeError, TypeError):
                 continue
         
         if not all_surfaces:
@@ -499,7 +501,7 @@ class DataLoader:
         try:
             market_data = self.fetch_stock_data(symbols)
             spot_prices = dict(zip(market_data['symbol'], market_data['spot_price']))
-        except Exception:
+        except (KeyError, ValueError, AttributeError):
             # Fallback: use default prices if fetch fails
             spot_prices = {symbol: 100.0 for symbol in symbols}
         

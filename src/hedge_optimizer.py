@@ -4,13 +4,30 @@ from typing import Dict, List, Optional, Tuple, Union
 import os
 from datetime import datetime
 from scipy.optimize import minimize
-from greeks_calculator import GreeksCalculator
+from .greeks_calculator import GreeksCalculator
+from .portfolio_aggregator import PortfolioAggregator
+
+# Constants
+DEFAULT_SPOT_PRICE = 100.0
+DEFAULT_BORROW_COST_BPS = 20.0
+DEFAULT_TRANSACTION_COST_BPS = 5.0
+DEFAULT_MAX_QUANTITY = 100000.0
+DEFAULT_DELTA_TOLERANCE = 0.01
+DEFAULT_RHO_TOLERANCE = 10000.0
+DEFAULT_BOND_DURATION_YEARS = 5.0
+BPS_TO_DECIMAL = 10000.0  # Basis points to decimal conversion
+DELTA_PENALTY_SCALE = 0.1
+RHO_PENALTY_SCALE = 0.001
+OPTIMIZATION_MAX_ITER = 1000
+OPTIMIZATION_FTOL = 1e-6
+QUANTITY_TOLERANCE = 1e-6  # For filtering near-zero hedge quantities
 
 
 class HedgeOptimizer:
     def __init__(self, data_dir: str = "data"):
         self.data_dir = data_dir
         self.greeks_calculator = GreeksCalculator(data_dir)
+        self.portfolio_aggregator = PortfolioAggregator(data_dir)
     
     def _parse_config(self, config: Optional[Dict]) -> Dict:
         """Parse and return configuration with defaults."""
@@ -18,8 +35,8 @@ class HedgeOptimizer:
         return {
             'include_etfs': config.get('include_etfs', True),
             'etf_symbols': config.get('etf_symbols', ['SPY']),
-            'default_transaction_cost_bps': config.get('default_transaction_cost_bps', 5.0),
-            'default_max_quantity': config.get('default_max_quantity', 100000.0),
+            'default_transaction_cost_bps': config.get('default_transaction_cost_bps', DEFAULT_TRANSACTION_COST_BPS),
+            'default_max_quantity': config.get('default_max_quantity', DEFAULT_MAX_QUANTITY),
             'use_market_data': config.get('use_market_data', True)
         }
     
@@ -63,7 +80,8 @@ class HedgeOptimizer:
                 )
             
             return market_data_dict
-        except Exception:
+        except (FileNotFoundError, pd.errors.EmptyDataError, KeyError, ValueError) as e:
+            # Silently return empty dict on data loading errors
             return {}
     
     def _extract_market_data_for_symbol(self, symbol: str, 
@@ -77,7 +95,11 @@ class HedgeOptimizer:
                 'borrow_cost_bps': float(borrow_cost_bps),
                 'transaction_cost_bps': float(transaction_cost) if transaction_cost is not None else default_transaction_cost_bps
             }
-        return {'spot_price': 100.0, 'borrow_cost_bps': 20.0, 'transaction_cost_bps': default_transaction_cost_bps}
+        return {
+            'spot_price': DEFAULT_SPOT_PRICE,
+            'borrow_cost_bps': DEFAULT_BORROW_COST_BPS,
+            'transaction_cost_bps': default_transaction_cost_bps
+        }
     
     def _calculate_rho_per_unit(self, instrument_type: str, spot_price: float,
                                  duration_years: Optional[float] = None,
@@ -87,7 +109,7 @@ class HedgeOptimizer:
             return 0.0  # Equities/ETFs have no rho
         elif instrument_type == 'bond':
             if duration_years is None:
-                duration_years = 5.0  # Default 5-year bond
+                duration_years = DEFAULT_BOND_DURATION_YEARS
             return self.greeks_calculator.compute_bond_rho(spot_price, duration_years, yield_to_maturity)
         elif instrument_type == 'fx_forward':
             # FX forwards have rho through interest rate differential
@@ -118,7 +140,7 @@ class HedgeOptimizer:
     
     def _add_interest_rate_instruments(self, config: Dict) -> List[Dict]:
         """Add interest rate instruments (bonds/Treasuries) to hedge rho."""
-        from data_loader import DataLoader
+        from .data_loader import DataLoader
         
         ir_instruments = []
         treasury_symbols = config.get('treasury_symbols', [])
@@ -137,7 +159,7 @@ class HedgeOptimizer:
                 treasury_data = treasury_data[treasury_data['symbol'].isin(treasury_symbols)]
                 if treasury_data.empty:
                     treasury_data = data_loader.fetch_treasury_etf_data(treasury_symbols, use_cache=config.get('use_market_data', True))
-        except Exception as e:
+        except (ValueError, FileNotFoundError, KeyError) as e:
             print(f"Warning: Could not fetch Treasury ETF data: {str(e)}")
             return []
         
@@ -258,9 +280,9 @@ class HedgeOptimizer:
         def objective(x):
             # Cost component
             notional = np.abs(x) * spot_prices
-            transaction_cost = np.sum(transaction_costs_bps * notional / 10000)
+            transaction_cost = np.sum(transaction_costs_bps * notional / BPS_TO_DECIMAL)
             short_mask = x < 0
-            borrow_cost = np.sum(borrow_costs_bps[short_mask] * notional[short_mask] / 10000)
+            borrow_cost = np.sum(borrow_costs_bps[short_mask] * notional[short_mask] / BPS_TO_DECIMAL)
             total_cost = transaction_cost + borrow_cost
             
             # Penalty component for deviation from targets
@@ -271,8 +293,8 @@ class HedgeOptimizer:
             
             # Penalty: square of deviation from target (scaled to be comparable to cost)
             # Use larger penalty weights to prioritize meeting targets over minimizing cost
-            delta_penalty = (residual_delta - delta_target) ** 2 * 0.1  # Scale factor
-            rho_penalty = (residual_rho - rho_target) ** 2 * 0.001  # Scale factor (rho is typically larger, but we want to hedge it)
+            delta_penalty = (residual_delta - delta_target) ** 2 * DELTA_PENALTY_SCALE
+            rho_penalty = (residual_rho - rho_target) ** 2 * RHO_PENALTY_SCALE
             
             return total_cost + delta_penalty + rho_penalty
         return objective
@@ -323,7 +345,7 @@ class HedgeOptimizer:
             if result.success:
                 return result.x, result.fun, 'optimal'
             return np.zeros(n_instruments), 0.0, f'failed: {result.message}'
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             return np.zeros(n_instruments), 0.0, f'error: {str(e)}'
     
     def _calculate_residual_exposures(self, hedge_quantities: np.ndarray,
@@ -348,7 +370,7 @@ class HedgeOptimizer:
         
         for idx, (_, row) in enumerate(hedge_universe.iterrows()):
             quantity = hedge_quantities[idx]
-            if abs(quantity) <= 1e-6:
+            if abs(quantity) <= QUANTITY_TOLERANCE:
                 continue
             
             spot_price = float(row['spot_price'])
@@ -360,7 +382,7 @@ class HedgeOptimizer:
                 'instrument_type': row['instrument_type'],
                 'hedge_quantity': float(quantity),
                 'side': 'buy' if quantity > 0 else 'sell',
-                'estimated_cost': cost_bps * notional / 10000,
+                'estimated_cost': cost_bps * notional / BPS_TO_DECIMAL,
                 'delta_contribution': float(quantity * row['delta_per_unit']),
                 'rho_contribution': float(quantity * rho_per_unit[idx]),
                 'timestamp': timestamp
@@ -516,7 +538,8 @@ class HedgeOptimizer:
         else:
             delta_weight, rho_weight = 0.8, 0.2
         
-        return max(0.0, min(100.0, (delta_weight * delta_reduction + rho_weight * rho_reduction) * 100.0))
+        effectiveness_pct = (delta_weight * delta_reduction + rho_weight * rho_reduction) * 100.0
+        return max(0.0, min(100.0, effectiveness_pct))
     
     def save_hedge_tickets(self, hedge_recommendations: pd.DataFrame):
         """
@@ -590,25 +613,56 @@ class HedgeOptimizer:
             raise IOError(f"Failed to save optimization summary to {filepath}: {str(e)}") from e
     
     def load_portfolio_exposures(self) -> Dict:
-        """Load and aggregate portfolio exposures from positions_with_greeks.csv."""
-        positions_path = os.path.join(self.data_dir, "positions_with_greeks.csv")
-        if not os.path.exists(positions_path):
-            raise FileNotFoundError(f"Positions file not found: {positions_path}")
+        """
+        Load and aggregate portfolio exposures from positions_with_greeks.csv.
         
-        positions = pd.read_csv(positions_path)
-        greeks = ['delta', 'rho', 'gamma', 'vega', 'theta']
+        This method delegates to PortfolioAggregator to maintain separation of concerns.
+        All aggregation logic is centralized in PortfolioAggregator.
         
-        exposures = {}
-        for greek in greeks:
-            col = f'position_{greek}'
-            exposures[f'total_{greek}'] = float(positions[col].sum()) if col in positions.columns else 0.0
+        Returns:
+            Dictionary with total_delta, total_gamma, total_vega, total_theta, total_rho, total_notional, num_positions
+        """
+        return self.portfolio_aggregator.load_and_aggregate_portfolio_greeks()
+    
+    def get_portfolio_symbol_breakdown(self) -> pd.DataFrame:
+        """
+        Get portfolio exposures broken down by symbol.
         
-        if 'quantity' in positions.columns and 'spot_price' in positions.columns:
-            exposures['total_notional'] = float((positions['quantity'] * positions['spot_price']).sum())
-        else:
-            exposures['total_notional'] = 0.0
-        exposures['num_positions'] = len(positions)
-        return exposures
+        Returns:
+            DataFrame with columns: symbol, delta, gamma, vega, theta, rho, notional, num_positions
+        """
+        return self.portfolio_aggregator.load_and_aggregate_by_symbol()
+    
+    def get_portfolio_instrument_type_breakdown(self) -> pd.DataFrame:
+        """
+        Get portfolio exposures broken down by instrument type (equity vs option).
+        
+        Returns:
+            DataFrame with columns: instrument_type, delta, gamma, vega, theta, rho, notional, num_positions
+        """
+        return self.portfolio_aggregator.load_and_aggregate_by_instrument_type()
+    
+    def get_top_risks(self, top_n: int = 10) -> pd.DataFrame:
+        """
+        Get top N risky positions by absolute delta.
+        
+        Args:
+            top_n: Number of top risky positions to return (default: 10)
+        
+        Returns:
+            DataFrame with top N risky positions
+        """
+        return self.portfolio_aggregator.load_and_identify_top_risks(top_n=top_n)
+    
+    def get_portfolio_summary_report(self) -> Dict:
+        """
+        Get complete portfolio summary report with all aggregations.
+        
+        Returns:
+            Dictionary containing portfolio_summary, symbol_breakdown, 
+            instrument_type_breakdown, and top_risks
+        """
+        return self.portfolio_aggregator.load_and_generate_summary_report()
     
     def load_market_data(self) -> pd.DataFrame:
         """
@@ -624,9 +678,13 @@ class HedgeOptimizer:
     
     def run_pipeline(self, targets: Optional[Dict] = None) -> Tuple[pd.DataFrame, Dict]:
         """Run the complete hedge optimization pipeline."""
-        positions = pd.read_csv(os.path.join(self.data_dir, "positions_with_greeks.csv"))
-        symbols = positions['symbol'].unique().tolist()
-        targets = targets or {'delta_target': 0.0, 'delta_tolerance': 0.01, 'rho_target': 0.0, 'rho_tolerance': 10.0}
+        symbols = self.portfolio_aggregator.get_unique_symbols()
+        targets = targets or {
+            'delta_target': 0.0,
+            'delta_tolerance': DEFAULT_DELTA_TOLERANCE,
+            'rho_target': 0.0,
+            'rho_tolerance': DEFAULT_RHO_TOLERANCE
+        }
         portfolio_exposures = self.load_portfolio_exposures()
         hedge_universe = self.build_hedge_universe(symbols)
         market_data = self.load_market_data() if os.path.exists(os.path.join(self.data_dir, "market_data.csv")) else pd.DataFrame()
@@ -676,6 +734,16 @@ class HedgeOptimizer:
         portfolio_exposures = self.load_portfolio_exposures()
         print(f"  Delta: {portfolio_exposures['total_delta']:,.2f}, Rho: {portfolio_exposures['total_rho']:,.2f}, Positions: {portfolio_exposures['num_positions']}")
         
+        # Show top risks
+        try:
+            top_risks = self.get_top_risks(top_n=5)
+            if not top_risks.empty and 'symbol' in top_risks.columns and 'position_delta' in top_risks.columns:
+                print(f"\nTop 5 Risky Positions (by absolute delta):")
+                for idx, row in top_risks.head(5).iterrows():
+                    print(f"  {row.get('symbol', 'N/A')}: {row.get('position_delta', 0):,.2f} delta")
+        except (KeyError, AttributeError, FileNotFoundError):
+            pass  # Silently skip if there's an issue
+        
         print(f"\nBuilding hedge universe...")
         hedge_universe = self.build_hedge_universe(symbols, hedge_config)
         print(f"  Instruments: {len(hedge_universe)}")
@@ -688,7 +756,7 @@ class HedgeOptimizer:
             print(f"  Warning: {str(e)}")
             market_data = pd.DataFrame()
         
-        print("\n[Optimizing...")
+        print("\nOptimizing...")
         hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(
             portfolio_exposures, hedge_universe, market_data, targets
         )

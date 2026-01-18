@@ -19,10 +19,10 @@ import sys
 # Add src directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from data_loader import DataLoader
-from greeks_calculator import GreeksCalculator
-from portfolio_aggregator import PortfolioAggregator
-from hedge_optimizer import HedgeOptimizer
+from .data_loader import DataLoader
+from .greeks_calculator import GreeksCalculator
+from .portfolio_aggregator import PortfolioAggregator
+from .hedge_optimizer import HedgeOptimizer
 
 
 def initialize_session_state():

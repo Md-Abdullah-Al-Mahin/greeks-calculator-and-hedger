@@ -1,9 +1,14 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from scipy.stats import norm
 import os
+
+# Constants
+DEFAULT_VOLATILITY = 0.25  # Default implied volatility (25%)
+MIN_VOLATILITY = 0.01  # Minimum reasonable volatility (1%) to avoid numerical issues
+DAYS_PER_YEAR = 365.0
 
 
 class GreeksCalculator:
@@ -33,7 +38,7 @@ class GreeksCalculator:
         """
         if current_date is None:
             current_date = datetime.now()
-        return (pd.to_datetime(expiry_date) - current_date).dt.days / 365.0
+        return (pd.to_datetime(expiry_date) - current_date).dt.days / DAYS_PER_YEAR
     
     def interpolate_interest_rate(self, time_to_expiry: float, rates: pd.DataFrame) -> float:
         """
@@ -55,7 +60,7 @@ class GreeksCalculator:
             raise ValueError("Rates DataFrame is empty")
         
         # Convert time_to_expiry from years to days
-        time_to_expiry_days = time_to_expiry * 365.0
+        time_to_expiry_days = time_to_expiry * DAYS_PER_YEAR
         
         # Ensure rates are sorted by tenor_days
         rates_sorted = rates.sort_values('tenor_days').copy()
@@ -97,16 +102,13 @@ class GreeksCalculator:
             - Interpolates based on strike for that expiry
             - Falls back to default volatility (0.25) if no data found
         """
-        DEFAULT_VOL = 0.25
-        MIN_VOL = 0.01  # Minimum reasonable volatility (1%) to avoid numerical issues
-        
         if vol_surface.empty:
-            return DEFAULT_VOL
+            return DEFAULT_VOLATILITY
         
         # Filter by symbol and convert expiry to datetime
         symbol_data = vol_surface[vol_surface['symbol'] == symbol].copy()
         if symbol_data.empty:
-            return DEFAULT_VOL
+            return DEFAULT_VOLATILITY
         
         symbol_data['expiry'] = pd.to_datetime(symbol_data['expiry'])
         
@@ -114,23 +116,23 @@ class GreeksCalculator:
         expiry_ts = pd.Timestamp(expiry)
         unique_expiries = pd.Series(symbol_data['expiry']).drop_duplicates().tolist()
         if not unique_expiries:
-            return DEFAULT_VOL
+            return DEFAULT_VOLATILITY
         
         time_diffs = [abs((pd.Timestamp(exp) - expiry_ts).total_seconds()) for exp in unique_expiries]
         closest_expiry = pd.Timestamp(unique_expiries[np.argmin(time_diffs)])
         
-        # Filter by closest expiry, valid vols (prefer reasonable vols >= MIN_VOL), and sort by strike
+        # Filter by closest expiry, valid vols (prefer reasonable vols >= MIN_VOLATILITY), and sort by strike
         expiry_data = pd.DataFrame(
-            symbol_data[(symbol_data['expiry'] == closest_expiry) & (symbol_data['implied_vol'] >= MIN_VOL)]
+            symbol_data[(symbol_data['expiry'] == closest_expiry) & (symbol_data['implied_vol'] >= MIN_VOLATILITY)]
         ).sort_values('strike')
         
-        # If no data with reasonable vols, try without the MIN_VOL filter
+        # If no data with reasonable vols, try without the MIN_VOLATILITY filter
         if expiry_data.empty:
             expiry_data = pd.DataFrame(
                 symbol_data[(symbol_data['expiry'] == closest_expiry) & (symbol_data['implied_vol'] > 0)]
             ).sort_values('strike')
             if expiry_data.empty:
-                return DEFAULT_VOL
+                return DEFAULT_VOLATILITY
         
         # Extract arrays and interpolate
         strikes = expiry_data['strike'].values.astype(float)
@@ -145,7 +147,7 @@ class GreeksCalculator:
             interpolated_vol = float(np.interp(strike, strikes, vols))
         
         # Enforce minimum volatility to avoid numerical issues in Black-Scholes
-        return max(interpolated_vol, MIN_VOL)        
+        return max(interpolated_vol, MIN_VOLATILITY)        
     
     def compute_black_scholes_greeks(self, spot: float, strike: float, time_to_expiry: float,
                                     rate: float, volatility: float, option_type: str,
@@ -171,9 +173,8 @@ class GreeksCalculator:
             return {'delta': 0.0, 'gamma': 0.0, 'vega': 0.0, 'theta': 0.0, 'rho': 0.0}
         
         # Enforce minimum volatility to avoid numerical issues
-        MIN_VOL = 0.01  # 1% minimum
-        if volatility < MIN_VOL:
-            volatility = MIN_VOL
+        if volatility < MIN_VOLATILITY:
+            volatility = MIN_VOLATILITY
         
         if volatility <= 0 or spot <= 0 or strike <= 0:
             return {'delta': 0.0, 'gamma': 0.0, 'vega': 0.0, 'theta': 0.0, 'rho': 0.0}
