@@ -4,8 +4,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import os
 from datetime import datetime
 from scipy.optimize import minimize
-from .greeks_calculator import GreeksCalculator
-from .portfolio_aggregator import PortfolioAggregator
+
+# Handle imports for both package and direct script execution
+try:
+    from .greeks_calculator import GreeksCalculator
+    from .portfolio_aggregator import PortfolioAggregator
+except ImportError:
+    from greeks_calculator import GreeksCalculator
+    from portfolio_aggregator import PortfolioAggregator
 
 # Constants
 DEFAULT_SPOT_PRICE = 100.0
@@ -15,6 +21,7 @@ DEFAULT_MAX_QUANTITY = 100000.0
 DEFAULT_DELTA_TOLERANCE = 0.01
 DEFAULT_RHO_TOLERANCE = 10000.0
 DEFAULT_BOND_DURATION_YEARS = 5.0
+DEFAULT_HOLDING_PERIOD_YEARS = 1.0  # Default holding period for annualized borrow costs
 BPS_TO_DECIMAL = 10000.0  # Basis points to decimal conversion
 DELTA_PENALTY_SCALE = 0.1
 RHO_PENALTY_SCALE = 0.001
@@ -140,7 +147,10 @@ class HedgeOptimizer:
     
     def _add_interest_rate_instruments(self, config: Dict) -> List[Dict]:
         """Add interest rate instruments (bonds/Treasuries) to hedge rho."""
-        from .data_loader import DataLoader
+        try:
+            from .data_loader import DataLoader
+        except ImportError:
+            from data_loader import DataLoader
         
         ir_instruments = []
         treasury_symbols = config.get('treasury_symbols', [])
@@ -275,14 +285,24 @@ class HedgeOptimizer:
     def _build_objective_function(self, spot_prices: np.ndarray, transaction_costs_bps: np.ndarray,
                                   borrow_costs_bps: np.ndarray, portfolio_delta: float, portfolio_rho: float,
                                   delta_target: float, rho_target: float,
-                                  delta_per_unit: np.ndarray, rho_per_unit: np.ndarray):
-        """Build objective function that minimizes total hedging cost and penalizes deviation from targets."""
+                                  delta_per_unit: np.ndarray, rho_per_unit: np.ndarray,
+                                  holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS):
+        """
+        Build objective function that minimizes total hedging cost and penalizes deviation from targets.
+        
+        Args:
+            holding_period_years: Holding period in years for scaling annualized borrow costs.
+                                 Default is 1.0 year, which means borrow costs (annualized bps) are
+                                 applied as one-time costs for a 1-year holding period.
+        """
         def objective(x):
             # Cost component
             notional = np.abs(x) * spot_prices
+            # Transaction costs are one-time costs (paid upfront)
             transaction_cost = np.sum(transaction_costs_bps * notional / BPS_TO_DECIMAL)
+            # Borrow costs are annualized, so scale by holding period
             short_mask = x < 0
-            borrow_cost = np.sum(borrow_costs_bps[short_mask] * notional[short_mask] / BPS_TO_DECIMAL)
+            borrow_cost = np.sum(borrow_costs_bps[short_mask] * notional[short_mask] / BPS_TO_DECIMAL * holding_period_years)
             total_cost = transaction_cost + borrow_cost
             
             # Penalty component for deviation from targets
@@ -363,8 +383,14 @@ class HedgeOptimizer:
     
     def _create_hedge_recommendations(self, hedge_universe: pd.DataFrame,
                                      hedge_quantities: np.ndarray,
-                                     rho_per_unit: np.ndarray) -> pd.DataFrame:
-        """Create hedge recommendations DataFrame from optimization results."""
+                                     rho_per_unit: np.ndarray,
+                                     holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> pd.DataFrame:
+        """
+        Create hedge recommendations DataFrame from optimization results.
+        
+        Args:
+            holding_period_years: Holding period in years for scaling annualized borrow costs.
+        """
         hedge_recommendations = []
         timestamp = datetime.now().isoformat()
         
@@ -375,14 +401,19 @@ class HedgeOptimizer:
             
             spot_price = float(row['spot_price'])
             notional = abs(quantity) * spot_price
-            cost_bps = float(row['transaction_cost_bps']) + (float(row['borrow_cost_bps']) if quantity < 0 else 0)
+            # Transaction cost is one-time, borrow cost is annualized (scale by holding period)
+            transaction_cost = float(row['transaction_cost_bps']) * notional / BPS_TO_DECIMAL
+            borrow_cost = (float(row['borrow_cost_bps']) * notional / BPS_TO_DECIMAL * holding_period_years) if quantity < 0 else 0.0
+            total_cost = transaction_cost + borrow_cost
             
             hedge_recommendations.append({
                 'symbol': row['symbol'],
                 'instrument_type': row['instrument_type'],
                 'hedge_quantity': float(quantity),
                 'side': 'buy' if quantity > 0 else 'sell',
-                'estimated_cost': cost_bps * notional / BPS_TO_DECIMAL,
+                'estimated_cost': total_cost,
+                'transaction_cost': transaction_cost,
+                'borrow_cost': borrow_cost,
                 'delta_contribution': float(quantity * row['delta_per_unit']),
                 'rho_contribution': float(quantity * rho_per_unit[idx]),
                 'timestamp': timestamp
@@ -407,7 +438,8 @@ class HedgeOptimizer:
     
     def optimize_hedge_portfolio(self, portfolio_exposures: Dict, hedge_universe: pd.DataFrame,
                                  market_data: pd.DataFrame, targets: Dict, 
-                                 constraints: Optional[Dict] = None) -> Tuple[pd.DataFrame, Dict]:
+                                 constraints: Optional[Dict] = None,
+                                 holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
         """
         Solve constrained optimization problem to meet targets at minimal cost.
         
@@ -425,6 +457,9 @@ class HedgeOptimizer:
                 - rho_target: Target rho (default: 0)
                 - rho_tolerance: Tolerance for rho constraint (default: 10000.0)
             constraints: Additional constraints (currently unused, reserved for future use)
+            holding_period_years: Holding period in years for scaling annualized borrow costs.
+                                 Borrow costs are annualized basis points, so they are scaled by
+                                 this holding period to get the actual cost. Default is 1.0 year.
         
         Returns:
             Tuple of (hedge_recommendations DataFrame, optimization_summary Dict)
@@ -452,7 +487,8 @@ class HedgeOptimizer:
             params['delta_target'],
             params['rho_target'],
             instrument_params['delta_per_unit'],
-            instrument_params['rho_per_unit']
+            instrument_params['rho_per_unit'],
+            holding_period_years=holding_period_years
         )
         
         # Build constraints
@@ -488,7 +524,8 @@ class HedgeOptimizer:
         hedge_recommendations_df = self._create_hedge_recommendations(
             hedge_universe,
             hedge_quantities,
-            instrument_params['rho_per_unit']
+            instrument_params['rho_per_unit'],
+            holding_period_years=holding_period_years
         )
         
         # Create optimization summary
@@ -676,7 +713,8 @@ class HedgeOptimizer:
             raise FileNotFoundError(f"Market data file not found: {market_data_path}")
         return pd.read_csv(market_data_path)
     
-    def run_pipeline(self, targets: Optional[Dict] = None) -> Tuple[pd.DataFrame, Dict]:
+    def run_pipeline(self, targets: Optional[Dict] = None, 
+                    holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
         """Run the complete hedge optimization pipeline."""
         symbols = self.portfolio_aggregator.get_unique_symbols()
         targets = targets or {
@@ -688,14 +726,18 @@ class HedgeOptimizer:
         portfolio_exposures = self.load_portfolio_exposures()
         hedge_universe = self.build_hedge_universe(symbols)
         market_data = self.load_market_data() if os.path.exists(os.path.join(self.data_dir, "market_data.csv")) else pd.DataFrame()
-        hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(portfolio_exposures, hedge_universe, market_data, targets)
+        hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(
+            portfolio_exposures, hedge_universe, market_data, targets,
+            holding_period_years=holding_period_years
+        )
         self.save_hedge_tickets(hedge_recommendations)
         self.save_optimization_summary(optimization_summary)
         return hedge_recommendations, optimization_summary
     
     def run_end_to_end(self, symbols: List[str], targets: Dict,
                       hedge_config: Optional[Dict] = None,
-                      save_results: bool = True) -> Tuple[pd.DataFrame, Dict]:
+                      save_results: bool = True,
+                      holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
         """
         Run the complete hedge optimization pipeline end-to-end.
         
@@ -720,6 +762,9 @@ class HedgeOptimizer:
                 - default_max_quantity: float, default maximum position size (default: 100000)
                 - use_market_data: bool, whether to load market data (default: True)
             save_results: If True, save hedge tickets and optimization summary to files
+            holding_period_years: Holding period in years for scaling annualized borrow costs.
+                                 Borrow costs are annualized basis points, so they are scaled by
+                                 this holding period. Default is 1.0 year.
         
         Returns:
             Tuple of (hedge_recommendations DataFrame, optimization_summary Dict)
@@ -758,7 +803,8 @@ class HedgeOptimizer:
         
         print("\nOptimizing...")
         hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(
-            portfolio_exposures, hedge_universe, market_data, targets
+            portfolio_exposures, hedge_universe, market_data, targets,
+            holding_period_years=holding_period_years
         )
         s = optimization_summary
         print(f"  Status: {s['solver_status']}, Trades: {s['num_hedge_trades']}, Cost: ${s['total_hedge_cost']:,.2f}")
