@@ -659,10 +659,21 @@ We build a bps estimate from:
    - &gt; 10%: +20 bps  
    - else: 0  
 
-Base 10 bps, then add the above; result is clamped to 5–500 bps. Data: `bid`, `ask`, `averageVolume` / `averageVolume10days`, `marketCap`, `sharesShort`, `sharesOutstanding` from `ticker.info`.
+5. **Dividend risk:**  
+   Shorts pay dividends to the lender. We add `dividend_yield × 10⁴` bps (cap 1000 bps) as a proxy for this carry. Source: `dividendYield` or `trailingAnnualDividendYield` from `info` (normalized to decimal).
+
+6. **HTB (hard-to-borrow) premium:**  
+   When `short_pct > 25%`, borrow can spike to 20–50%+; the base short factor is not enough. We add:  
+   - short_pct &gt; 45%: +2500 bps  
+   - short_pct &gt; 35%: +1500 bps  
+   - short_pct &gt; 25%: +500 bps  
+   - else: 0  
+
+Base 10 bps, then add the above. **Cap: 5000 bps (50%)** by default so hard-to-borrow names can reach 50%+; override via `DataLoader(..., borrow_cap_bps=...)` or the estimator’s `borrow_cap_bps` argument if needed. Floor 5 bps.  
+Data: `bid`, `ask`, `averageVolume` / `averageVolume10days`, `marketCap`, `sharesShort`, `sharesOutstanding`, `dividendYield` from `ticker.info`.
 
 **Why it’s a good starting point:**  
-Borrow is not in standard market feeds. This uses widely available fields that are correlated with specialness (spread, liquidity, short interest) and yields a number the optimizer can use for hedge cost. It’s a clear upgrade over a flat “10 bps for everything” and can be replaced later by prime-broker or data-vendor borrow rates.
+Borrow is not in standard market feeds. This uses widely available fields correlated with specialness (spread, liquidity, short interest) and **dividend risk** (shorts pay div to the lender). The **higher cap (50%)** and **HTB premium** avoid understating true cost for hard-to-borrow names that can exceed 5% in practice. It’s a clear upgrade over a flat assumption and can be replaced later by prime-broker or data-vendor borrow rates.
 
 ---
 
@@ -709,7 +720,7 @@ Duration is the main driver of rho for these ETFs. The mapping uses well-known, 
 | Input | Method | Why it’s a good starting point |
 |-------|--------|--------------------------------|
 | **Transaction cost** | Spread/2 + volume + cap + 2 bps base, from `info` | No broker data; captures spread and liquidity; usable in an optimizer. |
-| **Borrow cost** | Spread, volume, cap, short interest from `info` | No prime data; proxies for specialness; better than a flat assumption. |
+| **Borrow cost** | Spread, volume, cap, short interest, **dividend**, **HTB premium**; cap 5000 bps (50%) | No prime data; proxies for specialness + dividend risk; HTB overlay and higher cap for 50%+ names. |
 | **Implied vol** | Linear interp on surface; 25% if missing | 25% ≈ long-run equity; linear is simple and stable; easy to replace with a vol model. |
 | **Interest rate** | Linear interp in time; FRED or yf fallback | Standard for short-dated; easy to swap for a proper curve. |
 | **Treasury duration** | Lookup + ticker heuristic | Covers main rho hedges; good enough to compare hedges and add better data later. |

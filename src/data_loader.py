@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import json
 import os
 import yfinance as yf
@@ -21,9 +21,10 @@ class DataLoader:
     Orchestrates data fetching, caching, and saving CSVs with timestamps.
     """
     
-    def __init__(self, data_dir: str = "data", cache_expiry_hours: int = 1):
+    def __init__(self, data_dir: str = "data", cache_expiry_hours: int = 1, borrow_cap_bps: float = 5000.0):
         self.data_dir = data_dir
         self.cache_expiry_hours = cache_expiry_hours
+        self.borrow_cap_bps = borrow_cap_bps  # cap for borrow cost (e.g. 5000 = 50%); HTB can exceed
         os.makedirs(data_dir, exist_ok=True)
     
     def _get_cache_path(self, cache_key: str, metadata: bool = False) -> str:
@@ -101,85 +102,164 @@ class DataLoader:
                 pass
         return price
     
-    def _estimate_borrow_cost_from_liquidity(self, info: Dict, spot_price: float) -> float:
+    def _estimate_borrow_cost_from_liquidity(
+        self,
+        info: Dict,
+        spot_price: float,
+        *,
+        borrow_cap_bps: float = 5000.0,
+    ) -> Dict[str, Any]:
         """
         Estimate borrow cost (in basis points) from liquidity metrics.
         
-        Uses bid-ask spread, volume, market cap, and short interest.
+        Uses: bid-ask spread, volume, market cap, short interest, dividend yield,
+        and an HTB (hard-to-borrow) premium when short interest is very high.
+        Returns total_bps and a breakdown dict for logging and UI.
+        
+        - Cap: default 5000 bps (50%) so HTB names can reach 50%+; override via
+          borrow_cap_bps if needed.
+        - Dividend: shorts pay dividends to the lender; we add dividend_yield * 10^4
+          (capped at 1000 bps) as a proxy for this carry.
+        - HTB premium: when short_pct > 25%, we add 500–2500 bps to approximate
+          the jump when a name goes special (beyond what short_factor captures).
         """
-        # Bid-ask spread factor
-        bid, ask = info.get('bid'), info.get('ask')
+        bid = info.get('bid')
+        ask = info.get('ask')
         spread_pct = ((ask - bid) / bid * 100) if (bid and ask and bid > 0) else 0.1
         spread_factor = min(spread_pct * 100, 200)
         
-        # Volume factor (inverse: lower volume = higher cost)
-        avg_volume = info.get('averageVolume10days') or info.get('averageVolume', 0)
+        avg_volume = float(info.get('averageVolume10days') or info.get('averageVolume') or 0)
         if avg_volume > 0:
             volume_factor = min(max(0, 50 - np.log10(avg_volume) * 10), 100)
         else:
-            volume_factor = 100
+            volume_factor = 100.0
         
-        # Market cap factor
-        market_cap = info.get('marketCap', 0)
+        market_cap = float(info.get('marketCap') or 0)
         cap_factor = 0 if market_cap >= 10e9 else (20 if market_cap >= 1e9 else 50)
         
-        # Short interest factor
-        shares_short = info.get('sharesShort', 0)
-        shares_outstanding = info.get('sharesOutstanding', 0)
-        short_pct = (shares_short / shares_outstanding * 100) if shares_outstanding > 0 else 0
+        shares_short = float(info.get('sharesShort') or 0)
+        shares_outstanding = float(info.get('sharesOutstanding') or 0)
+        short_pct = (shares_short / shares_outstanding * 100) if shares_outstanding > 0 else 0.0
         short_factor = 50 if short_pct > 20 else (20 if short_pct > 10 else 0)
         
-        # Combine factors (base 10 bps, capped at 5-500 bps)
-        total = 10 + spread_factor + volume_factor + cap_factor + short_factor
-        return round(max(5, min(total, 500)), 2)
+        dy = float(info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0)
+        if dy > 1.0:
+            dy = dy / 100.0
+        dividend_bps = min(dy * 10000, 1000.0)
+        
+        # HTB premium: when short_pct is very high, borrow can spike to 20–50%+; add overlay
+        if short_pct > 45:
+            htb_premium = 2500.0
+        elif short_pct > 35:
+            htb_premium = 1500.0
+        elif short_pct > 25:
+            htb_premium = 500.0
+        else:
+            htb_premium = 0.0
+        
+        base = 10.0
+        total = base + spread_factor + volume_factor + cap_factor + short_factor + dividend_bps + htb_premium
+        total = round(max(5, min(total, borrow_cap_bps)), 2)
+        
+        return {
+            "total_bps": total,
+            "borrow_base_bps": base,
+            "borrow_spread_bps": round(spread_factor, 2),
+            "borrow_volume_bps": round(volume_factor, 2),
+            "borrow_cap_bps": cap_factor,
+            "borrow_short_bps": short_factor,
+            "borrow_dividend_bps": round(dividend_bps, 2),
+            "borrow_htb_premium_bps": round(htb_premium, 2),
+            "dividend_yield_borrow": round(dy, 4),
+            "bid": float(bid) if bid is not None else None,
+            "ask": float(ask) if ask is not None else None,
+            "avg_volume": avg_volume,
+            "market_cap": market_cap if market_cap > 0 else None,
+            "short_pct": round(short_pct, 2),
+            "spread_pct": round(spread_pct, 4),
+        }
     
-    def _estimate_transaction_cost_from_liquidity(self, info: Dict, spot_price: float) -> float:
+    def _estimate_transaction_cost_from_liquidity(self, info: Dict, spot_price: float) -> Dict[str, Any]:
         """
         Estimate transaction cost (in basis points) from liquidity metrics.
         
-        Uses bid-ask spread, volume, and market cap.
+        Uses bid-ask spread, volume, market cap, and volatility.
         Transaction cost represents the cost of executing a trade (one-way).
+        Returns total_bps and a breakdown dict for logging and UI.
         
         Components:
         - Bid-ask spread (primary): Half the spread as one-way cost
         - Volume factor: Lower volume = higher market impact
         - Market cap factor: Smaller cap = higher cost
+        - Volatility adjustment: Higher volatility increases execution risk and
+          dealer/inventory risk; we use 52-week range (realized vol proxy) and
+          beta (market-relative vol). Adds 0–20 bps.
         - Base commission: Assumed institutional commission
         """
-        # Bid-ask spread (primary component - one-way cost)
-        bid, ask = info.get('bid'), info.get('ask')
+        bid = info.get('bid')
+        ask = info.get('ask')
         if bid and ask and bid > 0:
             mid_price = (bid + ask) / 2
-            spread_bps = ((ask - bid) / mid_price) * 10000
-            spread_cost = min(spread_bps / 2, 50)  # One-way cost, cap at 50 bps
+            spread_bps_raw = ((ask - bid) / mid_price) * 10000
+            spread_cost = min(spread_bps_raw / 2, 50)  # One-way cost, cap at 50 bps
         else:
+            spread_bps_raw = 5.0  # default assumption
             spread_cost = 2.5  # Default spread cost (half of typical 5 bps spread)
         
-        # Volume factor (lower volume = higher market impact)
-        avg_volume = info.get('averageVolume10days') or info.get('averageVolume', 0)
+        avg_volume = float(info.get('averageVolume10days') or info.get('averageVolume') or 0)
         if avg_volume > 0:
-            # Logarithmic scaling: high volume = low cost
-            # For very high volume (>100M), cost approaches 0
-            # For low volume (<1M), cost increases significantly
             volume_factor = max(0, 10 - np.log10(max(avg_volume, 1)) * 2)
         else:
-            volume_factor = 10  # Default for unknown volume
+            volume_factor = 10.0
         
-        # Market cap factor (smaller cap = higher cost)
-        market_cap = info.get('marketCap', 0)
-        if market_cap >= 10e9:  # Large cap
+        market_cap = float(info.get('marketCap') or 0)
+        if market_cap >= 10e9:
             cap_factor = 0
-        elif market_cap >= 1e9:  # Mid cap
+        elif market_cap >= 1e9:
             cap_factor = 3
-        else:  # Small cap
+        else:
             cap_factor = 8
         
-        # Base commission (assume 2 bps for institutional trading)
-        base_commission = 2.0
+        # --- Volatility adjustment ---
+        # 52-week range: (high - low) / spot as a volatility proxy; scale to bps and cap
+        high = info.get('fiftyTwoWeekHigh') or info.get('52WeekHigh')
+        low = info.get('fiftyTwoWeekLow') or info.get('52WeekLow')
+        if high is not None and low is not None and spot_price > 0 and high > low:
+            range_pct = (float(high) - float(low)) / spot_price
+            range_bps = range_pct * 10000
+            vol_52w_bps = min(range_bps * 0.04, 12.0)  # 4% of 52w range in bps, cap 12
+        else:
+            vol_52w_bps = 0.0
         
-        # Total transaction cost
-        total = base_commission + spread_cost + volume_factor + cap_factor
-        return round(max(1, min(total, 100)), 2)  # Cap between 1-100 bps
+        # Beta: beta > 1 implies higher systematic volatility; add (beta - 1) * 4 bps, cap 10
+        raw_beta = info.get('beta') or info.get('beta3Year')
+        if raw_beta is not None:
+            beta = float(raw_beta)
+            vol_beta_bps = min(max(0, (beta - 1.0) * 4.0), 10.0) if beta > 1.0 else 0.0
+        else:
+            vol_beta_bps = 0.0
+        
+        tx_volatility_bps = round(min(vol_52w_bps + vol_beta_bps, 20.0), 2)  # cap combined at 20 bps
+        
+        base_commission = 2.0
+        total = base_commission + spread_cost + volume_factor + cap_factor + tx_volatility_bps
+        total = round(max(1, min(total, 100)), 2)
+        
+        return {
+            "total_bps": total,
+            "tx_base_bps": base_commission,
+            "tx_spread_bps": round(spread_cost, 2),
+            "tx_volume_bps": round(volume_factor, 2),
+            "tx_cap_bps": cap_factor,
+            "tx_volatility_bps": tx_volatility_bps,
+            "tx_vol_52w_bps": round(vol_52w_bps, 2),
+            "tx_vol_beta_bps": round(vol_beta_bps, 2),
+            "bid": float(bid) if bid is not None else None,
+            "ask": float(ask) if ask is not None else None,
+            "avg_volume": avg_volume,
+            "market_cap": market_cap if market_cap > 0 else None,
+            "spread_bps_raw": round(spread_bps_raw, 2) if (bid and ask and bid > 0) else None,
+        }
     
     def fetch_stock_data(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
         """
@@ -214,17 +294,48 @@ class DataLoader:
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
-                borrow_cost_bps = self._estimate_borrow_cost_from_liquidity(info, spot_price)
-                transaction_cost_bps = self._estimate_transaction_cost_from_liquidity(info, spot_price)
+                borrow = self._estimate_borrow_cost_from_liquidity(info, spot_price, borrow_cap_bps=self.borrow_cap_bps)
+                tx = self._estimate_transaction_cost_from_liquidity(info, spot_price)
+                borrow_cost_bps = borrow["total_bps"]
+                transaction_cost_bps = tx["total_bps"]
                 
-                results.append({
+                # Log costs per ticker
+                print(f"  {symbol}: transaction_cost={transaction_cost_bps} bps (base={tx['tx_base_bps']}, spread={tx['tx_spread_bps']}, vol={tx['tx_volume_bps']}, cap={tx['tx_cap_bps']}, volatility={tx.get('tx_volatility_bps', 0)}); borrow_cost={borrow_cost_bps} bps (base={borrow['borrow_base_bps']}, spread={borrow['borrow_spread_bps']}, vol={borrow['borrow_volume_bps']}, cap={borrow['borrow_cap_bps']}, short={borrow['borrow_short_bps']}, div={borrow.get('borrow_dividend_bps', 0)}, htb={borrow.get('borrow_htb_premium_bps', 0)})")
+                
+                row: Dict[str, Any] = {
                     'symbol': symbol,
                     'spot_price': float(spot_price),
                     'dividend_yield': float(dividend_yield),
                     'borrow_cost_bps': float(borrow_cost_bps),
                     'transaction_cost_bps': float(transaction_cost_bps),
-                    'last_updated': current_time.isoformat()
-                })
+                    'last_updated': current_time.isoformat(),
+                    # Transaction cost breakdown
+                    'tx_base_bps': tx['tx_base_bps'],
+                    'tx_spread_bps': tx['tx_spread_bps'],
+                    'tx_volume_bps': tx['tx_volume_bps'],
+                    'tx_cap_bps': tx['tx_cap_bps'],
+                    'tx_volatility_bps': tx.get('tx_volatility_bps', 0),
+                    'tx_vol_52w_bps': tx.get('tx_vol_52w_bps', 0),
+                    'tx_vol_beta_bps': tx.get('tx_vol_beta_bps', 0),
+                    'spread_bps_raw': tx.get('spread_bps_raw'),
+                    # Borrow cost breakdown
+                    'borrow_base_bps': borrow['borrow_base_bps'],
+                    'borrow_spread_bps': borrow['borrow_spread_bps'],
+                    'borrow_volume_bps': borrow['borrow_volume_bps'],
+                    'borrow_cap_bps': borrow['borrow_cap_bps'],
+                    'borrow_short_bps': borrow['borrow_short_bps'],
+                    'borrow_dividend_bps': borrow.get('borrow_dividend_bps', 0),
+                    'borrow_htb_premium_bps': borrow.get('borrow_htb_premium_bps', 0),
+                    'dividend_yield_borrow': borrow.get('dividend_yield_borrow'),
+                    'short_pct': borrow['short_pct'],
+                    'spread_pct': borrow['spread_pct'],
+                    # Inputs (shared)
+                    'bid': borrow.get('bid') or tx.get('bid'),
+                    'ask': borrow.get('ask') or tx.get('ask'),
+                    'avg_volume': borrow.get('avg_volume') if borrow.get('avg_volume', 0) > 0 else tx.get('avg_volume'),
+                    'market_cap': borrow.get('market_cap') or tx.get('market_cap'),
+                }
+                results.append(row)
             except (AttributeError, KeyError, ValueError, TypeError) as e:
                 failed_symbols.append(f"{symbol} ({str(e)})")
                 continue
@@ -782,8 +893,12 @@ class DataLoader:
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
-                borrow_cost_bps = self._estimate_borrow_cost_from_liquidity(info, spot_price)
-                transaction_cost_bps = self._estimate_transaction_cost_from_liquidity(info, spot_price)
+                borrow = self._estimate_borrow_cost_from_liquidity(info, spot_price, borrow_cap_bps=self.borrow_cap_bps)
+                tx = self._estimate_transaction_cost_from_liquidity(info, spot_price)
+                borrow_cost_bps = borrow["total_bps"]
+                transaction_cost_bps = tx["total_bps"]
+                
+                print(f"  {symbol}: transaction_cost={transaction_cost_bps} bps (base={tx['tx_base_bps']}, spread={tx['tx_spread_bps']}, vol={tx['tx_volume_bps']}, cap={tx['tx_cap_bps']}, volatility={tx.get('tx_volatility_bps', 0)}); borrow_cost={borrow_cost_bps} bps (base={borrow['borrow_base_bps']}, spread={borrow['borrow_spread_bps']}, vol={borrow['borrow_volume_bps']}, cap={borrow['borrow_cap_bps']}, short={borrow['borrow_short_bps']}, div={borrow.get('borrow_dividend_bps', 0)}, htb={borrow.get('borrow_htb_premium_bps', 0)})")
                 
                 # Get yield to maturity (30-day SEC yield or trailing yield)
                 yield_to_maturity = info.get('yield') or info.get('trailingAnnualDividendYield') or 0.0
@@ -806,7 +921,7 @@ class DataLoader:
                     else:
                         duration_years = 5.0  # Default
                 
-                results.append({
+                row = {
                     'symbol': symbol,
                     'spot_price': float(spot_price),
                     'dividend_yield': float(dividend_yield),
@@ -814,8 +929,31 @@ class DataLoader:
                     'transaction_cost_bps': float(transaction_cost_bps),
                     'yield_to_maturity': float(yield_to_maturity),
                     'duration_years': float(duration_years),
-                    'last_updated': current_time.isoformat()
-                })
+                    'last_updated': current_time.isoformat(),
+                    'tx_base_bps': tx['tx_base_bps'],
+                    'tx_spread_bps': tx['tx_spread_bps'],
+                    'tx_volume_bps': tx['tx_volume_bps'],
+                    'tx_cap_bps': tx['tx_cap_bps'],
+                    'tx_volatility_bps': tx.get('tx_volatility_bps', 0),
+                    'tx_vol_52w_bps': tx.get('tx_vol_52w_bps', 0),
+                    'tx_vol_beta_bps': tx.get('tx_vol_beta_bps', 0),
+                    'spread_bps_raw': tx.get('spread_bps_raw'),
+                    'borrow_base_bps': borrow['borrow_base_bps'],
+                    'borrow_spread_bps': borrow['borrow_spread_bps'],
+                    'borrow_volume_bps': borrow['borrow_volume_bps'],
+                    'borrow_cap_bps': borrow['borrow_cap_bps'],
+                    'borrow_short_bps': borrow['borrow_short_bps'],
+                    'borrow_dividend_bps': borrow.get('borrow_dividend_bps', 0),
+                    'borrow_htb_premium_bps': borrow.get('borrow_htb_premium_bps', 0),
+                    'dividend_yield_borrow': borrow.get('dividend_yield_borrow'),
+                    'short_pct': borrow['short_pct'],
+                    'spread_pct': borrow['spread_pct'],
+                    'bid': borrow.get('bid') or tx.get('bid'),
+                    'ask': borrow.get('ask') or tx.get('ask'),
+                    'avg_volume': tx.get('avg_volume') or borrow.get('avg_volume'),
+                    'market_cap': borrow.get('market_cap') or tx.get('market_cap'),
+                }
+                results.append(row)
             except Exception as e:
                 failed_symbols.append(f"{symbol} ({str(e)})")
                 print(f"Warning: Could not fetch data for {symbol}: {str(e)}")

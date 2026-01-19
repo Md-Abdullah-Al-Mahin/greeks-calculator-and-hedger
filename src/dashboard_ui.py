@@ -537,6 +537,119 @@ class DashboardUI:
             st.error(f"❌ Error in risk analytics: {str(e)}")
             st.exception(e)
 
+    def _render_costs_view(self) -> None:
+        st.header("💰 Transaction & Borrow Costs by Ticker")
+        st.caption("Estimated transaction cost (one-way) and borrow cost in basis points, with how each value was derived.")
+        data_dir = self._get_data_dir()
+        try:
+            loader = DataLoader(data_dir=data_dir)
+            market_data = loader.load_data("market_data.csv")
+        except FileNotFoundError:
+            st.warning("⚠️ Load **Real-Time Data** from the sidebar first to see costs by ticker.")
+            return
+        if market_data.empty:
+            st.info("No market data. Load Real-Time Data first.")
+            return
+
+        # Optional: Treasury ETF data
+        try:
+            treasury = loader.load_data("treasury_etf_data.csv")
+        except FileNotFoundError:
+            treasury = pd.DataFrame()
+
+        # Summary table: symbol, transaction_cost_bps, borrow_cost_bps
+        summary_cols = ["symbol", "transaction_cost_bps", "borrow_cost_bps"]
+        if "spot_price" in market_data.columns:
+            summary_cols.insert(1, "spot_price")
+        avail = [c for c in summary_cols if c in market_data.columns]
+        st.subheader("Costs summary (equities)")
+        st.dataframe(
+            market_data[avail].style.format(
+                {k: "{:,.2f}" for k in ["spot_price", "transaction_cost_bps", "borrow_cost_bps"] if k in avail}
+            ),
+            width="stretch",
+            height=min(400, 80 + 35 * len(market_data)),
+        )
+
+        # Detailed derivation: one expander per ticker
+        st.subheader("How each value was derived")
+        has_breakdown = "tx_base_bps" in market_data.columns and "borrow_base_bps" in market_data.columns
+
+        def _na(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return "N/A"
+            return v
+
+        def _cap_tier(mcap):
+            m = _na(mcap)
+            if m == "N/A" or m == 0:
+                return "unknown"
+            x = float(m)
+            if x >= 10e9:
+                return "large (≥$10B)"
+            if x >= 1e9:
+                return "mid (≥$1B)"
+            return "small (<$1B)"
+
+        for _, r in market_data.iterrows():
+            sym = r.get("symbol", "?")
+            with st.expander(f"**{sym}** — Transaction: {_na(r.get('transaction_cost_bps'))} bps · Borrow: {_na(r.get('borrow_cost_bps'))} bps"):
+                if not has_breakdown:
+                    st.info("Breakdown not available (cached data from before this feature). Uncheck **Use Cache** and click **Load Real-Time Data** to refresh.")
+                    continue
+                # --- Transaction cost derivation ---
+                st.markdown("#### Transaction cost (one-way)")
+                st.markdown("**Formula:** `total = base + spread + volume + cap + volatility` (capped 1–100 bps)")
+                base = _na(r.get("tx_base_bps", 2))
+                spread = _na(r.get("tx_spread_bps"))
+                vol = _na(r.get("tx_volume_bps"))
+                cap = _na(r.get("tx_cap_bps"))
+                vol_adj = _na(r.get("tx_volatility_bps", 0))
+                vol_52w = _na(r.get("tx_vol_52w_bps", 0))
+                vol_beta = _na(r.get("tx_vol_beta_bps", 0))
+                spread_raw = _na(r.get("spread_bps_raw"))
+                bid, ask = _na(r.get("bid")), _na(r.get("ask"))
+                avg_vol = _na(r.get("avg_volume"))
+                mcap = r.get("market_cap")
+                st.write("- **Base:** 2 bps (institutional assumption) → ", base, " bps")
+                st.write("- **Spread:** Bid ", bid, ", Ask ", ask, " → raw spread = (ask−bid)/mid×10⁴ = ", spread_raw, " bps; one-way = half, capped at 50 → **", spread, " bps**")
+                st.write("- **Volume:** avg_volume = ", f"{float(avg_vol):,.0f}" if isinstance(avg_vol, (int, float)) and not pd.isna(avg_vol) else avg_vol, " → factor = max(0, 10 − 2×log₁₀(V)) → **", vol, " bps**")
+                st.write("- **Market cap:** ", f"${float(mcap):,.0f}" if mcap is not None and not (isinstance(mcap, float) and pd.isna(mcap)) and float(mcap) > 0 else "N/A", " → ", _cap_tier(mcap), " → **", cap, " bps**")
+                st.write("- **Volatility adjustment:** 52w range (4% of (high−low)/spot, cap 12) + beta (if >1: (β−1)×4, cap 10); combined cap 20 → 52w **", vol_52w, "** + beta **", vol_beta, "** = **", vol_adj, " bps**")
+                st.write("- **Total:** ", base, " + ", spread, " + ", vol, " + ", cap, " + ", vol_adj, " = **", _na(r.get("transaction_cost_bps")), " bps**")
+
+                st.markdown("#### Borrow cost")
+                st.markdown("**Formula:** `total = base + spread + volume + cap + short + dividend + htb_premium` (capped 5–5000 bps, 50%)")
+                bbase = _na(r.get("borrow_base_bps", 10))
+                bspread = _na(r.get("borrow_spread_bps"))
+                bvol = _na(r.get("borrow_volume_bps"))
+                bcap = _na(r.get("borrow_cap_bps"))
+                bshort = _na(r.get("borrow_short_bps"))
+                bdiv = _na(r.get("borrow_dividend_bps", 0))
+                bhtb = _na(r.get("borrow_htb_premium_bps", 0))
+                short_pct = _na(r.get("short_pct"))
+                spread_pct = _na(r.get("spread_pct"))
+                div_y = _na(r.get("dividend_yield_borrow"))
+                st.write("- **Base:** 10 bps → ", bbase, " bps")
+                st.write("- **Spread:** spread_pct = (ask−bid)/bid×100 = ", spread_pct, "% → factor = min(pct×100, 200) → **", bspread, " bps**")
+                st.write("- **Volume:** factor = min(max(0, 50 − 10×log₁₀(V)), 100) → **", bvol, " bps**")
+                st.write("- **Market cap:** ", _cap_tier(mcap), " → **", bcap, " bps**")
+                st.write("- **Short interest:** short_pct = ", short_pct, "% → >20%=50, >10%=20, else 0 → **", bshort, " bps**")
+                st.write("- **Dividend risk:** dividend_yield = ", div_y, " → shorts pay div to lender; yield×10⁴ bps (cap 1000) → **", bdiv, " bps**")
+                st.write("- **HTB premium:** short_pct >25%: +500, >35%: +1500, >45%: +2500 bps (hard-to-borrow overlay) → **", bhtb, " bps**")
+                st.write("- **Total:** ", bbase, " + ", bspread, " + ", bvol, " + ", bcap, " + ", bshort, " + ", bdiv, " + ", bhtb, " = **", _na(r.get("borrow_cost_bps")), " bps**")
+
+        if not treasury.empty and "transaction_cost_bps" in treasury.columns:
+            st.subheader("Treasury ETFs (from hedge universe)")
+            t_avail = [c for c in ["symbol", "spot_price", "transaction_cost_bps", "borrow_cost_bps"] if c in treasury.columns]
+            st.dataframe(treasury[t_avail].style.format({k: "{:,.2f}" for k in t_avail if k in ["spot_price", "transaction_cost_bps", "borrow_cost_bps"]}), width="stretch")
+            if "tx_base_bps" in treasury.columns:
+                for _, r in treasury.iterrows():
+                    sym = r.get("symbol", "?")
+                    with st.expander(f"**{sym}** (Treasury) — Transaction: {_na(r.get('transaction_cost_bps'))} bps · Borrow: {_na(r.get('borrow_cost_bps'))} bps"):
+                        st.write("Same methodology as equities. Transaction: base + spread + volume + cap + volatility. Borrow: base + spread + volume + cap + short + dividend + htb_premium (capped 5–5000 bps).")
+                        st.write("Components: tx ", _na(r.get("tx_base_bps")), "+", _na(r.get("tx_spread_bps")), "+", _na(r.get("tx_volume_bps")), "+", _na(r.get("tx_cap_bps")), "+", _na(r.get("tx_volatility_bps", 0)), " | borrow ", _na(r.get("borrow_base_bps")), "+", _na(r.get("borrow_spread_bps")), "+", _na(r.get("borrow_volume_bps")), "+", _na(r.get("borrow_cap_bps")), "+", _na(r.get("borrow_short_bps")), "+", _na(r.get("borrow_dividend_bps", 0)), "+", _na(r.get("borrow_htb_premium_bps", 0)))
+
     def _render_settings(self) -> None:
         st.header("⚙️ Settings")
         st.subheader("Data Directory")
@@ -568,14 +681,16 @@ class DashboardUI:
         st.markdown("---")
         self._initialize_session_state()
         self._render_sidebar()
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Positions", "📈 Portfolio", "🛡️ Hedge Optimizer", "📊 Risk Analytics", "⚙️ Settings"])
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📋 Positions", "📈 Portfolio", "💰 Costs", "🛡️ Hedge Optimizer", "📊 Risk Analytics", "⚙️ Settings"])
         with tab1:
             self._render_positions_view()
         with tab2:
             self._render_portfolio_view()
         with tab3:
-            self._render_hedge_optimizer()
+            self._render_costs_view()
         with tab4:
-            self._render_risk_analytics()
+            self._render_hedge_optimizer()
         with tab5:
+            self._render_risk_analytics()
+        with tab6:
             self._render_settings()
