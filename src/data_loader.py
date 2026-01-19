@@ -663,9 +663,10 @@ class DataLoader:
             # Randomly select symbol
             symbol = np.random.choice(symbols)
             spot_price = spot_prices.get(symbol, 100.0)
+
+            equity_to_option_ratio = np.random.random()
             
-            # 60% equities, 40% options
-            is_option = np.random.random() < 0.4
+            is_option = np.random.random() < equity_to_option_ratio
             
             if is_option:
                 # Generate option position
