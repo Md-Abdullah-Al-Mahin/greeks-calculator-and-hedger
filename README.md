@@ -554,7 +554,167 @@ loader = DataLoader(data_dir="your_data_directory")
 
 ### Caching
 
-The system uses intelligent caching with 1-hour expiry by default. Cache files are stored alongside data files with `cache_` prefix and corresponding `_metadata.json` files for cache validation.
+The system uses intelligent caching with 1-hour expiry by default. Cache files are stored alongside data files with `cache_` prefix and corresponding `_metadata.json` files for cache validation. When a cache is invalid (expired or missing), the stale `.csv` and `_metadata.json` for that key are deleted before refetching.
+
+---
+
+## 8. How the Finance Works & Estimation Approach
+
+This section explains the models and formulas used for pricing and risk, and how we **estimate** inputs when they are not directly available. For each estimation, we describe **how it is done** and **why it is a good starting point** for an MVP (and what you would add later for production).
+
+### 8.1 Options: Black–Scholes–Merton (Greeks)
+
+**What we use:** The Merton (dividend-adjusted Black–Scholes) model for European options.
+
+- **d1, d2:**  
+  `d1 = (ln(S/K) + (r - q + σ²/2)T) / (σ√T)`,  
+  `d2 = d1 - σ√T`  
+  with `q` = dividend yield.
+- **Delta (call):** `Δ = e^(-qT) Φ(d1)`; **(put):** `Δ = e^(-qT) (Φ(d1) - 1)`.
+- **Gamma:** `Γ = e^(-qT) φ(d1) / (S σ √T)` (same for call/put).
+- **Vega:** `ν = S e^(-qT) φ(d1) √T` (per 1 absolute vol move).
+- **Theta:** standard closed-form call/put theta including `-r K e^(-rT) Φ(d2)`, `+q S e^(-qT) Φ(d1)`, and the volatility term.
+- **Rho:** `ρ = K T e^(-rT) Φ(d2)` (call) or `-K T e^(-rT) Φ(-d2)` (put).
+
+**Why it’s a good base:** The formulas are standard, well-tested, and match textbook/industry behavior (e.g. ATM call delta ≈ 0.5, gamma/vega positive). Dividends matter for single-name equity; the `(r - q)` and discount terms make the greeks sensible for dividend payers. For a first version, this is the right level of sophistication before adding American early exercise, skew, or exotics.
+
+---
+
+### 8.2 Bonds / Treasury ETFs: Rho via Modified Duration
+
+**What we use:**  
+`ρ = -D_mod × P × 0.01`  
+with `D_mod = D_Mac / (1 + y)` and `D_Mac` approximated by a duration-in-years (from a mapping or heuristic). The 0.01 corresponds to a 1% (100 bps) parallel shift in rates.
+
+**Why it’s a good base:** This is the standard first-order rate sensitivity for fixed income. It’s sufficient to build rho-neutral hedges with Treasury ETFs (TLT, IEF, SHY, etc.) and to reason about hedge effectiveness. Convexity can be added later for larger rate moves.
+
+---
+
+### 8.3 Scenario P&L: Taylor (Greeks) Approximation
+
+**What we use:**  
+`P&L ≈ Δ·ΔS + ½ Γ·(ΔS)² + ν·Δσ + θ·Δt + ρ·Δr`
+
+- ΔS: underlying price change  
+- Δσ: volatility change (in absolute terms, e.g. 0.01)  
+- Δt: time decay in years  
+- Δr: rate change in decimal (e.g. 25 bps → 0.0025)
+
+**Why it’s a good base:** This is the usual second-order expansion in price and first-order in vol, time, and rates. It’s fast, transparent, and good for small-to-moderate moves (e.g. a few percent in spot, a few vol points, days of theta). For very large moves (>~20%) or long horizons, you’d move to full revaluation or more terms.
+
+---
+
+### 8.4 Estimations: How They’re Done and Why They’re a Good Starting Point
+
+Several inputs are not always observable or are expensive to source. We estimate them from cheap, public-style data. Below: **how** each is implemented and **why** it’s a reasonable starting point.
+
+#### A. Transaction Cost (basis points, one-way)
+
+**How:**  
+We approximate one-way execution cost in bps from:
+
+1. **Bid-ask spread:**  
+   `spread_bps = (ask - bid) / mid × 10^4`; we take **half** as the one-way cost and cap at 50 bps.  
+   Rationale: crossing the spread is the main explicit cost; half-spread is a common proxy for one-way.
+
+2. **Volume factor:**  
+   `volume_factor = max(0, 10 - 2×log10(avg_volume))`.  
+   Lower volume → higher cost; high volume → factor → 0.  
+   Rationale: lower liquidity implies higher market impact for a given size.
+
+3. **Market cap factor:**  
+   - Large (≥ $10B): 0  
+   - Mid (≥ $1B): 3 bps  
+   - Small: 8 bps  
+
+4. **Base commission:** 2 bps (institutional-style).
+
+Total is capped between 1 and 100 bps. We use **yahoo `info`** (bid, ask, `averageVolume` / `averageVolume10days`, `marketCap`) when available.
+
+**Why it’s a good starting point:**  
+You don’t need broker or execution data. The structure captures the main economic drivers (spread, liquidity, size) and produces bps in a plausible range (single digits for large, liquid names; higher for small/illiquid). The optimizer can compare hedges on a level playing field. For production, you’d swap in TCA or broker/EMS execution estimates and keep the same bps interface.
+
+---
+
+#### B. Borrow Cost (basis points, for shorting)
+
+**How:**  
+We build a bps estimate from:
+
+1. **Spread factor:**  
+   `spread_pct = (ask - bid) / bid × 100`; `spread_factor = min(spread_pct × 100, 200)`.  
+   Wider spread → harder to borrow.
+
+2. **Volume factor:**  
+   `volume_factor = min(max(0, 50 - 10×log10(avg_volume)), 100)`.  
+   Low volume → higher borrow cost.
+
+3. **Market cap:**  
+   - ≥ $10B: 0  
+   - ≥ $1B: 20  
+   - &lt; $1B: 50  
+
+4. **Short interest:**  
+   - &gt; 20% of float: +50 bps  
+   - &gt; 10%: +20 bps  
+   - else: 0  
+
+Base 10 bps, then add the above; result is clamped to 5–500 bps. Data: `bid`, `ask`, `averageVolume` / `averageVolume10days`, `marketCap`, `sharesShort`, `sharesOutstanding` from `ticker.info`.
+
+**Why it’s a good starting point:**  
+Borrow is not in standard market feeds. This uses widely available fields that are correlated with specialness (spread, liquidity, short interest) and yields a number the optimizer can use for hedge cost. It’s a clear upgrade over a flat “10 bps for everything” and can be replaced later by prime-broker or data-vendor borrow rates.
+
+---
+
+#### C. Implied Volatility (when missing or no surface)
+
+**How:**  
+- If we have a vol surface (from options chains): we pick the closest expiry, then **linearly interpolate in strike**; if the strike is outside the available range, we extrapolate using the boundary value.  
+- If there is no usable surface or the symbol has no options: we use **DEFAULT_VOLATILITY = 0.25 (25%)**, with a floor of 1% to avoid numerical issues.
+
+**Why it’s a good starting point:**  
+- **25%:** In the ballpark of long-run equity vol (e.g. S&P sectors). Greeks are not wildly off for many names.  
+- **Linear in strike:** Simple, robust, and fine for a first pass. It doesn’t capture smile/skew; for that you’d move to a vol model (SABR, etc.) or richer interpolation.  
+- **Closest expiry, then strike:** Uses the most relevant part of the surface; for many use cases this is enough to get deltas and vegas in a plausible range.
+
+---
+
+#### D. Interest Rate (for discount and option rho)
+
+**How:**  
+- We use a **rates curve** with `tenor_days` and `rate` (decimal).  
+- For a given `time_to_expiry` (years), we convert to days and **linearly interpolate** between tenor points; before the first tenor we use the first rate; after the last, the last rate.  
+- Sources: FRED (DGS1MO, DGS3MO, …, DGS10) when `pandas-datareader` is available; else yfinance Treasury tickers (e.g. ^IRX, ^FVX, ^TNX) with a final fallback to sensible flat defaults.
+
+**Why it’s a good starting point:**  
+Linear interpolation in time is standard for short-dated options and is easy to explain and audit. For longer maturities or more sophisticated discounting you’d use a proper curve (splines, OIS, etc.); for an MVP, linear in time is a reasonable and robust choice.
+
+---
+
+#### E. Treasury ETF Duration (for bond rho)
+
+**How:**  
+- We keep a **small mapping** for common tickers, e.g.:  
+  TLT 17.5, IEF 7.5, SHY 2, TBT/TBF 17.5, IEI/VGIT 5 (years).  
+- If the symbol is not in the map, we use **heuristics on the ticker** (e.g. “20” or “LONG” → 17; “10” or “7” → 7; “3” or “5” → 5; “1” or “SHORT” → 2; else 5).  
+- Yield: from `info` (`yield` or `trailingAnnualDividendYield`), with a percent→decimal check.
+
+**Why it’s a good starting point:**  
+Duration is the main driver of rho for these ETFs. The mapping uses well-known, publicly available figures for TLT/IEF/SHY; the heuristic gives a plausible order of magnitude for unknowns (e.g. 5y as default). That’s enough to build and compare rho hedges. For production, you’d plug in provider or issuer duration (or derive from holdings) and keep the same `duration_years` → `compute_bond_rho` interface.
+
+---
+
+### 8.5 Summary: Estimation as a First Pass
+
+| Input | Method | Why it’s a good starting point |
+|-------|--------|--------------------------------|
+| **Transaction cost** | Spread/2 + volume + cap + 2 bps base, from `info` | No broker data; captures spread and liquidity; usable in an optimizer. |
+| **Borrow cost** | Spread, volume, cap, short interest from `info` | No prime data; proxies for specialness; better than a flat assumption. |
+| **Implied vol** | Linear interp on surface; 25% if missing | 25% ≈ long-run equity; linear is simple and stable; easy to replace with a vol model. |
+| **Interest rate** | Linear interp in time; FRED or yf fallback | Standard for short-dated; easy to swap for a proper curve. |
+| **Treasury duration** | Lookup + ticker heuristic | Covers main rho hedges; good enough to compare hedges and add better data later. |
+
+All of these are designed so you can **replace one piece at a time** (e.g. real borrow, real vol surface, or a proper rates curve) without changing the rest of the finance or the optimizer’s bps-based cost interface.
 
 ---
 

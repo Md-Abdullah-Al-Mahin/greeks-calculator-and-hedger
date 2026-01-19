@@ -47,9 +47,19 @@ class DataLoader:
         except (FileNotFoundError, json.JSONDecodeError, ValueError, KeyError):
             return False
     
+    def _delete_stale_cache(self, cache_key: str) -> None:
+        """Remove cache .csv and _metadata.json for a key if they exist."""
+        for path in [self._get_cache_path(cache_key), self._get_cache_path(cache_key, metadata=True)]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    
     def _load_from_cache(self, cache_key: str) -> Optional[pd.DataFrame]:
-        """Load data from cache if valid."""
+        """Load data from cache if valid. If invalid, deletes the stale cache files."""
         if not self._is_cache_valid(cache_key):
+            self._delete_stale_cache(cache_key)
             return None
         try:
             return pd.read_csv(self._get_cache_path(cache_key))
