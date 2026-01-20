@@ -580,6 +580,33 @@ class DashboardUI:
                 return "N/A"
             return v
 
+        def _fmt(val, fmt="{:,.2f}"):
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return "N/A"
+            try:
+                return fmt.format(float(val))
+            except (TypeError, ValueError):
+                return str(val)
+
+        def _fmt_int(val):
+            return _fmt(val, "{:,.0f}")
+
+        def _fmt_usd_short(val):
+            """Compact USD for remarks (e.g. $3.78T, $1.5B) to avoid long digit strings."""
+            if val is None or (isinstance(val, float) and pd.isna(val)) or float(val or 0) <= 0:
+                return "N/A"
+            try:
+                x = float(val)
+                if x >= 1e12:
+                    return f"${x / 1e12:.2f}T"
+                if x >= 1e9:
+                    return f"${x / 1e9:.2f}B"
+                if x >= 1e6:
+                    return f"${x / 1e6:.1f}M"
+                return f"${x:,.0f}"
+            except (TypeError, ValueError):
+                return "N/A"
+
         def _cap_tier(mcap):
             m = _na(mcap)
             if m == "N/A" or m == 0:
@@ -597,9 +624,6 @@ class DashboardUI:
                 if not has_breakdown:
                     st.info("Breakdown not available (cached data from before this feature). Uncheck **Use Cache** and click **Load Real-Time Data** to refresh.")
                     continue
-                # --- Transaction cost derivation ---
-                st.markdown("#### Transaction cost (one-way)")
-                st.markdown("**Formula:** `total = base + spread + volume + cap + volatility` (capped 1–100 bps)")
                 base = _na(r.get("tx_base_bps", 2))
                 spread = _na(r.get("tx_spread_bps"))
                 vol = _na(r.get("tx_volume_bps"))
@@ -609,17 +633,24 @@ class DashboardUI:
                 vol_beta = _na(r.get("tx_vol_beta_bps", 0))
                 spread_raw = _na(r.get("spread_bps_raw"))
                 bid, ask = _na(r.get("bid")), _na(r.get("ask"))
-                avg_vol = _na(r.get("avg_volume"))
+                avg_vol = r.get("avg_volume")
                 mcap = r.get("market_cap")
-                st.write("- **Base:** 2 bps (institutional assumption) → ", base, " bps")
-                st.write("- **Spread:** Bid ", bid, ", Ask ", ask, " → raw spread = (ask−bid)/mid×10⁴ = ", spread_raw, " bps; one-way = half, capped at 50 → **", spread, " bps**")
-                st.write("- **Volume:** avg_volume = ", f"{float(avg_vol):,.0f}" if isinstance(avg_vol, (int, float)) and not pd.isna(avg_vol) else avg_vol, " → factor = max(0, 10 − 2×log₁₀(V)) → **", vol, " bps**")
-                st.write("- **Market cap:** ", f"${float(mcap):,.0f}" if mcap is not None and not (isinstance(mcap, float) and pd.isna(mcap)) and float(mcap) > 0 else "N/A", " → ", _cap_tier(mcap), " → **", cap, " bps**")
-                st.write("- **Volatility adjustment:** 52w range (4% of (high−low)/spot, cap 12) + beta (if >1: (β−1)×4, cap 10); combined cap 20 → 52w **", vol_52w, "** + beta **", vol_beta, "** = **", vol_adj, " bps**")
-                st.write("- **Total:** ", base, " + ", spread, " + ", vol, " + ", cap, " + ", vol_adj, " = **", _na(r.get("transaction_cost_bps")), " bps**")
+                tx_total = _na(r.get("transaction_cost_bps"))
+                # --- Transaction cost table ---
+                st.markdown("#### Transaction cost (one-way)")
+                st.caption("Formula: total = base + spread + volume + cap + volatility (capped 1–100 bps)")
+                tx_rows = [
+                    {"Component": "Base", "bps": base, "Remarks": "2 bps institutional assumption"},
+                    {"Component": "Spread", "bps": spread, "Remarks": f"Bid {bid}, Ask {ask}; raw {spread_raw} bps, one-way half cap 50"},
+                    {"Component": "Volume", "bps": vol, "Remarks": f"Avg vol {_fmt_int(avg_vol)}; max(0, 10−2×log₁₀(V))"},
+                    {"Component": "Market cap", "bps": cap, "Remarks": f"{_fmt_usd_short(mcap)}, {_cap_tier(mcap)}"},
+                    {"Component": "Volatility", "bps": vol_adj, "Remarks": f"52w: {vol_52w} + beta: {vol_beta}, combined cap 20"},
+                    {"Component": "Total", "bps": tx_total, "Remarks": f"{base} + {spread} + {vol} + {cap} + {vol_adj}"},
+                ]
+                tx_df = pd.DataFrame(tx_rows)
+                st.dataframe(tx_df, use_container_width=True, hide_index=True)
 
-                st.markdown("#### Borrow cost")
-                st.markdown("**Formula:** `total = base + spread + volume + cap + short + dividend + htb_premium` (capped 5–5000 bps, 50%)")
+                # --- Borrow cost table ---
                 bbase = _na(r.get("borrow_base_bps", 10))
                 bspread = _na(r.get("borrow_spread_bps"))
                 bvol = _na(r.get("borrow_volume_bps"))
@@ -630,14 +661,21 @@ class DashboardUI:
                 short_pct = _na(r.get("short_pct"))
                 spread_pct = _na(r.get("spread_pct"))
                 div_y = _na(r.get("dividend_yield_borrow"))
-                st.write("- **Base:** 10 bps → ", bbase, " bps")
-                st.write("- **Spread:** spread_pct = (ask−bid)/bid×100 = ", spread_pct, "% → factor = min(pct×100, 200) → **", bspread, " bps**")
-                st.write("- **Volume:** factor = min(max(0, 50 − 10×log₁₀(V)), 100) → **", bvol, " bps**")
-                st.write("- **Market cap:** ", _cap_tier(mcap), " → **", bcap, " bps**")
-                st.write("- **Short interest:** short_pct = ", short_pct, "% → >20%=50, >10%=20, else 0 → **", bshort, " bps**")
-                st.write("- **Dividend risk:** dividend_yield = ", div_y, " → shorts pay div to lender; yield×10⁴ bps (cap 1000) → **", bdiv, " bps**")
-                st.write("- **HTB premium:** short_pct >25%: +500, >35%: +1500, >45%: +2500 bps (hard-to-borrow overlay) → **", bhtb, " bps**")
-                st.write("- **Total:** ", bbase, " + ", bspread, " + ", bvol, " + ", bcap, " + ", bshort, " + ", bdiv, " + ", bhtb, " = **", _na(r.get("borrow_cost_bps")), " bps**")
+                borrow_total = _na(r.get("borrow_cost_bps"))
+                st.markdown("#### Borrow cost")
+                st.caption("Formula: total = base + spread + volume + cap + short + dividend + htb_premium (capped 5–5000 bps, 50%)")
+                borrow_rows = [
+                    {"Component": "Base", "bps": bbase, "Remarks": "10 bps"},
+                    {"Component": "Spread", "bps": bspread, "Remarks": f"(ask−bid)/bid {spread_pct}%; min(pct×100, 200)"},
+                    {"Component": "Volume", "bps": bvol, "Remarks": "min(max(0, 50−10×log₁₀(V)), 100)"},
+                    {"Component": "Market cap", "bps": bcap, "Remarks": _cap_tier(mcap)},
+                    {"Component": "Short interest", "bps": bshort, "Remarks": f"{short_pct}%; >20%=50, >10%=20, else 0"},
+                    {"Component": "Dividend risk", "bps": bdiv, "Remarks": f"yield {div_y}; ×10⁴ cap 1000"},
+                    {"Component": "HTB premium", "bps": bhtb, "Remarks": "short >25%=+500, >35%=+1500, >45%=+2500"},
+                    {"Component": "Total", "bps": borrow_total, "Remarks": f"{bbase} + {bspread} + {bvol} + {bcap} + {bshort} + {bdiv} + {bhtb}"},
+                ]
+                borrow_df = pd.DataFrame(borrow_rows)
+                st.dataframe(borrow_df, use_container_width=True, hide_index=True)
 
         if not treasury.empty and "transaction_cost_bps" in treasury.columns:
             st.subheader("Treasury ETFs (from hedge universe)")
@@ -647,8 +685,43 @@ class DashboardUI:
                 for _, r in treasury.iterrows():
                     sym = r.get("symbol", "?")
                     with st.expander(f"**{sym}** (Treasury) — Transaction: {_na(r.get('transaction_cost_bps'))} bps · Borrow: {_na(r.get('borrow_cost_bps'))} bps"):
-                        st.write("Same methodology as equities. Transaction: base + spread + volume + cap + volatility. Borrow: base + spread + volume + cap + short + dividend + htb_premium (capped 5–5000 bps).")
-                        st.write("Components: tx ", _na(r.get("tx_base_bps")), "+", _na(r.get("tx_spread_bps")), "+", _na(r.get("tx_volume_bps")), "+", _na(r.get("tx_cap_bps")), "+", _na(r.get("tx_volatility_bps", 0)), " | borrow ", _na(r.get("borrow_base_bps")), "+", _na(r.get("borrow_spread_bps")), "+", _na(r.get("borrow_volume_bps")), "+", _na(r.get("borrow_cap_bps")), "+", _na(r.get("borrow_short_bps")), "+", _na(r.get("borrow_dividend_bps", 0)), "+", _na(r.get("borrow_htb_premium_bps", 0)))
+                        st.caption("Same methodology as equities.")
+                        tx_b = _na(r.get("tx_base_bps"))
+                        tx_s = _na(r.get("tx_spread_bps"))
+                        tx_v = _na(r.get("tx_volume_bps"))
+                        tx_c = _na(r.get("tx_cap_bps"))
+                        tx_vol = _na(r.get("tx_volatility_bps", 0))
+                        tx_tot = _na(r.get("transaction_cost_bps"))
+                        bo_b = _na(r.get("borrow_base_bps"))
+                        bo_s = _na(r.get("borrow_spread_bps"))
+                        bo_v = _na(r.get("borrow_volume_bps"))
+                        bo_c = _na(r.get("borrow_cap_bps"))
+                        bo_sh = _na(r.get("borrow_short_bps"))
+                        bo_d = _na(r.get("borrow_dividend_bps", 0))
+                        bo_h = _na(r.get("borrow_htb_premium_bps", 0))
+                        bo_tot = _na(r.get("borrow_cost_bps"))
+                        st.markdown("##### Transaction cost (one-way)")
+                        tx_t = pd.DataFrame([
+                            {"Component": "Base", "bps": tx_b, "Remarks": "2 bps"},
+                            {"Component": "Spread", "bps": tx_s, "Remarks": "one-way, cap 50"},
+                            {"Component": "Volume", "bps": tx_v, "Remarks": "max(0, 10−2×log₁₀(V))"},
+                            {"Component": "Market cap", "bps": tx_c, "Remarks": "tier"},
+                            {"Component": "Volatility", "bps": tx_vol, "Remarks": "52w + beta, cap 20"},
+                            {"Component": "Total", "bps": tx_tot, "Remarks": f"{tx_b} + {tx_s} + {tx_v} + {tx_c} + {tx_vol}"},
+                        ])
+                        st.dataframe(tx_t, use_container_width=True, hide_index=True)
+                        st.markdown("##### Borrow cost")
+                        bo_t = pd.DataFrame([
+                            {"Component": "Base", "bps": bo_b, "Remarks": "10 bps"},
+                            {"Component": "Spread", "bps": bo_s, "Remarks": "min(pct×100, 200)"},
+                            {"Component": "Volume", "bps": bo_v, "Remarks": "min(max(0, 50−10×log₁₀(V)), 100)"},
+                            {"Component": "Market cap", "bps": bo_c, "Remarks": "tier"},
+                            {"Component": "Short interest", "bps": bo_sh, "Remarks": ">20%=50, >10%=20"},
+                            {"Component": "Dividend risk", "bps": bo_d, "Remarks": "yield×10⁴ cap 1000"},
+                            {"Component": "HTB premium", "bps": bo_h, "Remarks": ">25%=+500, >35%=+1500, >45%=+2500"},
+                            {"Component": "Total", "bps": bo_tot, "Remarks": f"{bo_b} + {bo_s} + {bo_v} + {bo_c} + {bo_sh} + {bo_d} + {bo_h}"},
+                        ])
+                        st.dataframe(bo_t, use_container_width=True, hide_index=True)
 
     def _render_settings(self) -> None:
         st.header("⚙️ Settings")
