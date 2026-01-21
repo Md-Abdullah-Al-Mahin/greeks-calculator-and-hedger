@@ -5,6 +5,10 @@ import os
 from datetime import datetime
 from scipy.optimize import minimize
 
+DAYS_PER_YEAR = 365.0
+DEFAULT_VOLATILITY = 0.25
+OPTIONS_CONTRACT_MULTIPLIER = 100  # US equity options: 100 shares per contract
+
 # Handle imports for both package and direct script execution
 try:
     from .greeks_calculator import GreeksCalculator
@@ -44,7 +48,14 @@ class HedgeOptimizer:
             'etf_symbols': config.get('etf_symbols', ['SPY']),
             'default_transaction_cost_bps': config.get('default_transaction_cost_bps', DEFAULT_TRANSACTION_COST_BPS),
             'default_max_quantity': config.get('default_max_quantity', DEFAULT_MAX_QUANTITY),
-            'use_market_data': config.get('use_market_data', True)
+            'use_market_data': config.get('use_market_data', True),
+            # Option hedge universe (Phase 1); include_options=False preserves backward compatibility
+            'include_options': config.get('include_options', False),
+            'option_hedge_symbols': config.get('option_hedge_symbols', ['SPY', 'QQQ', 'IWM']),
+            'min_option_volume': config.get('min_option_volume', 0),
+            'min_option_open_interest': config.get('min_option_open_interest', 0),
+            'max_option_instruments_per_underlying': config.get('max_option_instruments_per_underlying', 150),
+            'option_max_contracts': config.get('option_max_contracts', 1000),
         }
     
     def _build_hedge_symbols_list(self, symbols: List[str], include_etfs: bool, 
@@ -195,6 +206,198 @@ class HedgeOptimizer:
         
         return ir_instruments
     
+    def _load_rates_df(self, use_market_data: bool) -> pd.DataFrame:
+        """Load risk-free rates from rates.csv or fetch via DataLoader."""
+        path = os.path.join(self.data_dir, "rates.csv")
+        if use_market_data and os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                if not df.empty and 'tenor_days' in df.columns and 'rate' in df.columns:
+                    return df
+            except (FileNotFoundError, pd.errors.EmptyDataError, KeyError):
+                pass
+        try:
+            from .data_loader import DataLoader
+        except ImportError:
+            from data_loader import DataLoader
+        loader = DataLoader(self.data_dir)
+        return loader.fetch_risk_free_rates(use_cache=use_market_data)
+    
+    def _load_hedge_options_df(self) -> pd.DataFrame:
+        """Load hedge options from hedge_options.csv (created by DataLoader.load_all_data)."""
+        path = os.path.join(self.data_dir, "hedge_options.csv")
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                if not df.empty:
+                    return df
+            except (FileNotFoundError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                pass
+        return pd.DataFrame()
+    
+    def _filter_options_by_liquidity(self, df: pd.DataFrame, min_vol: int, min_oi: int) -> pd.DataFrame:
+        """Filter options by minimum volume or open interest."""
+        if min_vol <= 0 and min_oi <= 0:
+            return df
+        v = np.asarray(df['volume'], dtype=float) if 'volume' in df.columns else np.zeros(len(df))
+        o = np.asarray(df['openInterest'], dtype=float) if 'openInterest' in df.columns else np.zeros(len(df))
+        vol = np.where(np.isnan(v), 0, v)
+        oi = np.where(np.isnan(o), 0, o)
+        return pd.DataFrame(df.loc[(vol >= min_vol) | (oi >= min_oi)]).copy()
+    
+    def _get_top_liquid_options(self, df: pd.DataFrame, underlying: str, max_count: int) -> pd.DataFrame:
+        """Get top N most liquid options for an underlying, sorted by volume + open interest."""
+        sub = pd.DataFrame(df[df['symbol'] == underlying])
+        if sub.empty:
+            return sub
+        sub = sub.copy()
+        vol = sub['volume'].fillna(0).astype(float) if 'volume' in sub.columns else pd.Series(0.0, index=sub.index)
+        oi = sub['openInterest'].fillna(0).astype(float) if 'openInterest' in sub.columns else pd.Series(0.0, index=sub.index)
+        sub['_liq'] = vol + oi
+        return sub.sort_values(by=['_liq'], ascending=False).head(max_count)  # type: ignore[call-overload]
+    
+    def _compute_option_mid_price(self, row: pd.Series) -> Optional[float]:
+        """Compute mid price from bid/ask, fallback to lastPrice. Returns None if unavailable."""
+        bid, ask, last = row.get('bid'), row.get('ask'), row.get('lastPrice')
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) and not np.isnan(bid) and not np.isnan(ask) and ask > 0:
+            return (float(bid) + float(ask)) / 2.0
+        if isinstance(last, (int, float)) and not np.isnan(last) and last > 0:
+            return float(last)
+        return None
+    
+    def _parse_option_row(self, row: pd.Series, now: datetime) -> Optional[Dict]:
+        """Parse and validate option row fields. Returns dict with parsed values or None if invalid."""
+        spot = row.get('underlying_spot')
+        if spot is None or (isinstance(spot, float) and (np.isnan(spot) or spot <= 0)):
+            return None
+        
+        strike_val = row.get('strike')
+        if strike_val is None or (isinstance(strike_val, float) and np.isnan(strike_val)) or float(strike_val) <= 0:
+            return None
+        
+        expiry = row.get('expiry')
+        if expiry is None:
+            return None
+        try:
+            exp_ts = pd.Timestamp(expiry)
+        except Exception:
+            return None
+        
+        tte = (exp_ts - now).total_seconds() / (DAYS_PER_YEAR * 24 * 3600)
+        if tte <= 0:
+            return None
+        
+        opt_type = str(row.get('option_type', 'call')).lower()
+        if opt_type not in ('call', 'put'):
+            return None
+        
+        iv = row.get('impliedVolatility')
+        if iv is None or (isinstance(iv, float) and (np.isnan(iv) or iv <= 0)):
+            iv = DEFAULT_VOLATILITY
+        iv = max(float(iv), 1e-3)
+        
+        div = float(row.get('dividend_yield', 0.0) or 0.0)
+        if div > 1.0:
+            div = div / 100.0
+        
+        mid = self._compute_option_mid_price(row)
+        if mid is None or mid <= 0:
+            return None
+        
+        exp_str = str(expiry) if not hasattr(expiry, 'strftime') else expiry.strftime('%Y-%m-%d')
+        
+        return {
+            'spot': float(spot),
+            'strike': float(strike_val),
+            'tte': tte,
+            'opt_type': opt_type,
+            'iv': iv,
+            'div': div,
+            'mid': mid,
+            'exp_str': exp_str,
+        }
+    
+    def _create_option_record(
+        self, underlying: str, parsed: Dict, greeks: Dict,
+        max_contracts: float, default_tx_bps: float
+    ) -> Dict:
+        """Create hedge universe record for an option instrument."""
+        opt_id = f"{underlying}_{parsed['exp_str']}_{parsed['strike']}_{parsed['opt_type']}"
+        return {
+            'symbol': opt_id,
+            'instrument_type': 'option',
+            'spot_price': parsed['mid'] * OPTIONS_CONTRACT_MULTIPLIER,
+            'borrow_cost_bps': 0.0,
+            'transaction_cost_bps': float(default_tx_bps),
+            'max_long_quantity': float(max_contracts),
+            'max_short_quantity': float(max_contracts),
+            'delta_per_unit': float(greeks['delta'] * OPTIONS_CONTRACT_MULTIPLIER),
+            'rho_per_unit': float(greeks['rho'] * OPTIONS_CONTRACT_MULTIPLIER),
+            'duration_years': 0.0,
+            'underlying': underlying,
+            'strike': parsed['strike'],
+            'expiry': parsed['exp_str'],
+            'option_type': parsed['opt_type'],
+        }
+    
+    def _add_option_instruments(self, config: Dict) -> List[Dict]:
+        """
+        Add option instruments to hedge universe. Reads from hedge_options.csv.
+        Each option gets delta/rho from Black-Scholes; spot_price is premium per contract (mid price).
+        """
+        if not config.get('include_options', False):
+            return []
+        
+        symbols = config.get('option_hedge_symbols', ['SPY', 'QQQ', 'IWM'])
+        min_vol = config.get('min_option_volume', 0)
+        min_oi = config.get('min_option_open_interest', 0)
+        max_per_underlying = config.get('max_option_instruments_per_underlying', 150)
+        max_contracts = config.get('option_max_contracts', 1000)
+        default_tx_bps = config.get('default_transaction_cost_bps', DEFAULT_TRANSACTION_COST_BPS)
+        use_market_data = config.get('use_market_data', True)
+        
+        chains = self._load_hedge_options_df()
+        if chains.empty:
+            return []
+        
+        chains = pd.DataFrame(chains[chains['symbol'].isin(symbols)]).copy()
+        chains = self._filter_options_by_liquidity(chains, min_vol, min_oi)
+        if chains.empty:
+            return []
+        
+        rates = self._load_rates_df(use_market_data)
+        default_rate = 0.05
+        if rates is not None and not rates.empty and 'tenor_days' in rates.columns and 'rate' in rates.columns:
+            short = rates[rates['tenor_days'] <= 30]
+            default_rate = float(short.iloc[0]['rate']) if not short.empty else float(rates.iloc[0]['rate'])
+        
+        records: List[Dict] = []
+        now = datetime.now()
+        
+        for underlying in symbols:
+            top_options = self._get_top_liquid_options(chains, underlying, max_per_underlying)
+            if top_options.empty:
+                continue
+            
+            for _, row in top_options.iterrows():
+                parsed = self._parse_option_row(row, now)
+                if parsed is None:
+                    continue
+                
+                try:
+                    rate = self.greeks_calculator.interpolate_interest_rate(parsed['tte'], rates) if rates is not None and not rates.empty else default_rate
+                except Exception:
+                    rate = default_rate
+                
+                greeks = self.greeks_calculator.compute_black_scholes_greeks(
+                    spot=parsed['spot'], strike=parsed['strike'], time_to_expiry=parsed['tte'],
+                    rate=rate, volatility=parsed['iv'], option_type=parsed['opt_type'], dividend_yield=parsed['div']
+                )
+                
+                records.append(self._create_option_record(underlying, parsed, greeks, max_contracts, default_tx_bps))
+        
+        return records
+    
     def build_hedge_universe(self, symbols: List[str], config: Optional[Dict] = None) -> pd.DataFrame:
         """
         Build the list of available hedge instruments with limits and costs.
@@ -209,12 +412,18 @@ class HedgeOptimizer:
                 - default_transaction_cost_bps: float, default transaction cost in basis points (default: 5.0)
                 - default_max_quantity: float, default maximum position size (default: 100000)
                 - use_market_data: bool, whether to load market data for prices/costs (default: True)
+                - include_options: bool, whether to add options on SPY/QQQ/IWM (default: False; backward compatible)
+                - option_hedge_symbols: List[str], underlyings for option chains (default: ['SPY', 'QQQ', 'IWM'])
+                - min_option_volume: int, min volume for option liquidity filter (default: 0)
+                - min_option_open_interest: int, min open interest for option liquidity filter (default: 0)
+                - max_option_instruments_per_underlying: int, cap per underlying (default: 150)
+                - option_max_contracts: float, max long/short contracts per option (default: 1000)
         
         Returns:
             DataFrame with columns:
-                - symbol: Hedge instrument symbol
-                - instrument_type: 'equity', 'etf', or 'bond'
-                - spot_price: Current market price
+                - symbol: Hedge instrument symbol (for options: underlying_expiry_strike_type)
+                - instrument_type: 'equity', 'etf', 'bond', or 'option'
+                - spot_price: Current market price (for options: premium per contract)
                 - borrow_cost_bps: Cost to short in basis points
                 - transaction_cost_bps: Transaction cost in basis points
                 - max_long_quantity: Maximum long position allowed
@@ -249,6 +458,10 @@ class HedgeOptimizer:
             ir_instruments = self._add_interest_rate_instruments(parsed_config)
             universe_records.extend(ir_instruments)
         
+        # Add option instruments (SPY, QQQ, IWM) when include_options=True; off by default for backward compatibility
+        opt_instruments = self._add_option_instruments(parsed_config)
+        universe_records.extend(opt_instruments)
+        
         return pd.DataFrame(universe_records)
     
     def _extract_optimization_parameters(self, portfolio_exposures: Dict, targets: Dict) -> Dict:
@@ -270,6 +483,8 @@ class HedgeOptimizer:
             rho_per_unit = hedge_universe['rho_per_unit'].values.astype(float)
         else:
             rho_per_unit = np.zeros(n)
+        # Option instruments: premium is included in objective; is_option used there
+        is_option = (hedge_universe['instrument_type'] == 'option').values if 'instrument_type' in hedge_universe.columns else np.zeros(n, dtype=bool)
         
         return {
             'spot_prices': hedge_universe['spot_price'].values.astype(float),
@@ -279,31 +494,44 @@ class HedgeOptimizer:
             'max_short': hedge_universe['max_short_quantity'].values.astype(float),
             'delta_per_unit': hedge_universe['delta_per_unit'].values.astype(float),
             'rho_per_unit': rho_per_unit,
-            'n_instruments': n
+            'n_instruments': n,
+            'is_option': is_option,
         }
     
     def _build_objective_function(self, spot_prices: np.ndarray, transaction_costs_bps: np.ndarray,
                                   borrow_costs_bps: np.ndarray, portfolio_delta: float, portfolio_rho: float,
                                   delta_target: float, rho_target: float,
                                   delta_per_unit: np.ndarray, rho_per_unit: np.ndarray,
-                                  holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS):
+                                  holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS,
+                                  is_option_mask: Optional[np.ndarray] = None):
         """
         Build objective function that minimizes total hedging cost and penalizes deviation from targets.
+        For option instruments, adds premium cost (x * spot_price); for delta-1 instruments, premium
+        is not applied (backward compatible when is_option_mask is None or all False).
         
         Args:
             holding_period_years: Holding period in years for scaling annualized borrow costs.
                                  Default is 1.0 year, which means borrow costs (annualized bps) are
                                  applied as one-time costs for a 1-year holding period.
+            is_option_mask: Optional boolean array, True for option instruments. Premium term is
+                            applied only where True. If None, no premium term (delta-1 only).
         """
+        if is_option_mask is None:
+            is_option_mask = np.zeros_like(spot_prices, dtype=bool)
+        
         def objective(x):
             # Cost component
             notional = np.abs(x) * spot_prices
             # Transaction costs are one-time costs (paid upfront)
             transaction_cost = np.sum(transaction_costs_bps * notional / BPS_TO_DECIMAL)
-            # Borrow costs are annualized, so scale by holding period
+            # Borrow costs are annualized, so scale by holding period (options have borrow_cost_bps=0)
             short_mask = x < 0
             borrow_cost = np.sum(borrow_costs_bps[short_mask] * notional[short_mask] / BPS_TO_DECIMAL * holding_period_years)
             total_cost = transaction_cost + borrow_cost
+            
+            # Option premium: long pays x*spot_price, short receives (x negative), so x*spot_price
+            premium_cost = np.sum(x[is_option_mask] * spot_prices[is_option_mask])
+            total_cost = total_cost + premium_cost
             
             # Penalty component for deviation from targets
             hedge_delta = np.sum(x * delta_per_unit)
@@ -406,7 +634,13 @@ class HedgeOptimizer:
             borrow_cost = (float(row['borrow_cost_bps']) * notional / BPS_TO_DECIMAL * holding_period_years) if quantity < 0 else 0.0
             total_cost = transaction_cost + borrow_cost
             
-            hedge_recommendations.append({
+            # For options: include premium in estimated_cost (long pays, short receives)
+            is_opt = str(row.get('instrument_type', '')) == 'option'
+            if is_opt:
+                premium = float(quantity * spot_price)  # negative for short (receive)
+                total_cost = transaction_cost + borrow_cost + premium
+            
+            rec = {
                 'symbol': row['symbol'],
                 'instrument_type': row['instrument_type'],
                 'hedge_quantity': float(quantity),
@@ -417,7 +651,12 @@ class HedgeOptimizer:
                 'delta_contribution': float(quantity * row['delta_per_unit']),
                 'rho_contribution': float(quantity * rho_per_unit[idx]),
                 'timestamp': timestamp
-            })
+            }
+            for k in ('underlying', 'strike', 'expiry', 'option_type'):
+                val = row.get(k) if k in row else None
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    rec[k] = val
+            hedge_recommendations.append(rec)
         
         return pd.DataFrame(hedge_recommendations)
     
@@ -488,7 +727,8 @@ class HedgeOptimizer:
             params['rho_target'],
             instrument_params['delta_per_unit'],
             instrument_params['rho_per_unit'],
-            holding_period_years=holding_period_years
+            holding_period_years=holding_period_years,
+            is_option_mask=instrument_params.get('is_option'),
         )
         
         # Build constraints

@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 import json
 import os
 import yfinance as yf
@@ -101,6 +101,20 @@ class DataLoader:
             except (KeyError, IndexError, AttributeError):
                 pass
         return price
+    
+    def _get_spot_and_dividend(self, symbol: str) -> Tuple[Any, float]:
+        """Get underlying spot price and dividend yield for a symbol. Reuses _get_price."""
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            spot = self._get_price(ticker, info)
+            dy = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0.0
+            dy = float(dy) if dy is not None else 0.0
+            if dy > 1.0:
+                dy = dy / 100.0
+            return (float(spot) if spot is not None else np.nan, dy)
+        except (TypeError, AttributeError, ValueError, KeyError):
+            return (np.nan, 0.0)
     
     def _estimate_borrow_cost_from_liquidity(
         self,
@@ -456,13 +470,21 @@ class DataLoader:
         print(f"Fetched {len(df)} risk-free rate tenors")
         return df
     
-    def fetch_options_chain(self, symbol: str, use_cache: bool = True) -> pd.DataFrame:
+    def fetch_options_chain(
+        self,
+        symbol: str,
+        use_cache: bool = True,
+        min_volume: int = 0,
+        min_open_interest: int = 0,
+    ) -> pd.DataFrame:
         """
         Fetch options chain with strikes, prices, volumes, and implied volatility.
         
         Args:
             symbol: Stock symbol to fetch options for
             use_cache: If True, load from cache if available and valid
+            min_volume: Optional minimum volume to keep (0 = no extra filter)
+            min_open_interest: Optional minimum open interest to keep (0 = no extra filter)
         
         Returns:
             DataFrame with columns: symbol, expiry, strike, option_type, lastPrice, 
@@ -471,7 +493,15 @@ class DataLoader:
         cache_key = f"options_chain_{symbol}"
         if use_cache and (cached := self._load_from_cache(cache_key)) is not None:
             print(f"Using cached options chain for {symbol}")
-            return cached
+            out = cached
+            # Apply extra liquidity filter when params > 0 (cache does not store filter)
+            if (min_volume > 0 or min_open_interest > 0) and not out.empty and 'volume' in out.columns and 'openInterest' in out.columns:
+                v = np.asarray(out['volume'], dtype=float)
+                o = np.asarray(out['openInterest'], dtype=float)
+                vol = np.where(np.isnan(v), 0, v)
+                oi = np.where(np.isnan(o), 0, o)
+                out = out.loc[(vol >= min_volume) | (oi >= min_open_interest)].copy()
+            return out
         
         print(f"Fetching options chain for {symbol}")
         
@@ -514,21 +544,97 @@ class DataLoader:
             
             df_result = df[required_cols].copy()
             
-            # Filter out illiquid options
+            # Filter out illiquid options: (volume>0)|(openInterest>0); cache stores this only
             if 'volume' in df_result.columns and 'openInterest' in df_result.columns:
-                volume_filled = pd.Series(df_result['volume']).fillna(0)
-                oi_filled = pd.Series(df_result['openInterest']).fillna(0)
-                mask = (volume_filled > 0) | (oi_filled > 0)
-                df_result = df_result.loc[mask].copy()
+                v = np.asarray(df_result['volume'], dtype=float)
+                o = np.asarray(df_result['openInterest'], dtype=float)
+                vol = np.where(np.isnan(v), 0, v)
+                oi = np.where(np.isnan(o), 0, o)
+                df_result = df_result.loc[((vol > 0) | (oi > 0))].copy()
             
             if use_cache and isinstance(df_result, pd.DataFrame) and not df_result.empty:
                 self._save_to_cache(df_result, cache_key)
+            # Apply optional min_volume/min_open_interest after cache save so cache stays reusable
+            if (min_volume > 0 or min_open_interest > 0) and not df_result.empty and 'volume' in df_result.columns and 'openInterest' in df_result.columns:
+                v = np.asarray(df_result['volume'], dtype=float)
+                o = np.asarray(df_result['openInterest'], dtype=float)
+                vol = np.where(np.isnan(v), 0, v)
+                oi = np.where(np.isnan(o), 0, o)
+                df_result = df_result.loc[(vol >= min_volume) | (oi >= min_open_interest)].copy()
             if isinstance(df_result, pd.DataFrame) and not df_result.empty:
                 print(f"Fetched {len(df_result)} options for {symbol}")
             return df_result if isinstance(df_result, pd.DataFrame) else pd.DataFrame()
             
         except (AttributeError, KeyError, ValueError, TypeError):
             return pd.DataFrame()
+    
+    def fetch_options_chains_for_hedge_symbols(
+        self,
+        symbols: List[str],
+        use_cache: bool = True,
+        min_volume: int = 0,
+        min_open_interest: int = 0,
+    ) -> pd.DataFrame:
+        """
+        Fetch and combine options chains for hedge symbols (e.g. SPY, QQQ, IWM) with
+        underlying spot and dividend yield. Reuses fetch_stock_data, fetch_options_chain,
+        and _get_spot_and_dividend (which uses _get_price).
+        
+        Args:
+            symbols: Underlying symbols to fetch options for (e.g. ['SPY', 'QQQ', 'IWM'])
+            use_cache: If True, use cached per-symbol options chains when valid
+            min_volume: Minimum volume to keep (passed to fetch_options_chain; 0 = no extra filter)
+            min_open_interest: Minimum open interest to keep (passed to fetch_options_chain; 0 = no extra filter)
+        
+        Returns:
+            DataFrame with columns: symbol, expiry, strike, option_type, lastPrice,
+            volume, openInterest, impliedVolatility, bid, ask, underlying_spot, dividend_yield
+        """
+        if not symbols:
+            return pd.DataFrame()
+        
+        # Reuse fetch_stock_data for underlying spot and dividend yield
+        spot_by: Dict[str, float] = {}
+        div_by: Dict[str, float] = {}
+        try:
+            stock_df = self.fetch_stock_data(symbols, use_cache=use_cache)
+            for _, r in stock_df.iterrows():
+                s = str(r['symbol'])
+                spot_by[s] = float(r['spot_price'])
+                div_by[s] = float(r.get('dividend_yield', 0.0) or 0.0)
+        except (ValueError, KeyError, Exception):
+            pass
+        
+        # Fallback for symbols missing from fetch_stock_data: try fetch_stock_data([s]), else _get_spot_and_dividend
+        for s in symbols:
+            if s in spot_by:
+                continue
+            try:
+                one = self.fetch_stock_data([s], use_cache=use_cache)
+                if not one.empty:
+                    spot_by[s] = float(one.iloc[0]['spot_price'])
+                    div_by[s] = float(one.iloc[0].get('dividend_yield', 0.0) or 0.0)
+                else:
+                    spot_by[s], div_by[s] = self._get_spot_and_dividend(s)
+            except Exception:
+                spot_by[s], div_by[s] = self._get_spot_and_dividend(s)
+        
+        # Reuse fetch_options_chain (with liquidity params) and enrich with underlying_spot, dividend_yield
+        all_chains: List[pd.DataFrame] = []
+        for symbol in symbols:
+            chain = self.fetch_options_chain(
+                symbol, use_cache=use_cache, min_volume=min_volume, min_open_interest=min_open_interest
+            )
+            if chain.empty:
+                continue
+            chain = chain.copy()
+            chain['underlying_spot'] = spot_by.get(symbol, np.nan)
+            chain['dividend_yield'] = div_by.get(symbol, 0.0)
+            all_chains.append(chain)
+        
+        if not all_chains:
+            return pd.DataFrame()
+        return pd.concat(all_chains, ignore_index=True)
     
     def build_volatility_surface(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
         """
@@ -782,9 +888,15 @@ class DataLoader:
         filepath = os.path.join(self.data_dir, filename)
         return pd.read_csv(filepath)
     
-    def load_all_data(self, symbols: List[str], num_positions: int = 20, 
-                     seed: Optional[int] = None, use_cache: bool = True,
-                     generate_positions: bool = True) -> Dict[str, pd.DataFrame]:
+    def load_all_data(
+        self,
+        symbols: List[str],
+        num_positions: int = 20,
+        seed: Optional[int] = None,
+        use_cache: bool = True,
+        generate_positions: bool = True,
+        hedge_option_symbols: Optional[List[str]] = None,
+    ) -> Dict[str, pd.DataFrame]:
         """
         Do-it-all function: Fetches all required data and saves to expected file names.
         
@@ -793,6 +905,7 @@ class DataLoader:
         2. Fetches risk-free rates → saves as 'rates.csv'
         3. Builds volatility surface → saves as 'vol_surface.csv'
         4. Generates synthetic positions → saves as 'positions.csv'
+        5. Fetches options chains for hedge symbols → saves as 'hedge_options.csv'
         
         Args:
             symbols: List of stock symbols to fetch data for
@@ -800,16 +913,17 @@ class DataLoader:
             seed: Random seed for position generation (for reproducibility)
             use_cache: If True, use cached data when available
             generate_positions: If True, generate synthetic positions; if False, skip
+            hedge_option_symbols: Symbols to fetch options chains for hedging (default: ['SPY', 'QQQ', 'IWM'])
         
         Returns:
-            Dictionary with keys: 'market_data', 'rates', 'vol_surface', 'positions'
+            Dictionary with keys: 'market_data', 'rates', 'vol_surface', 'positions', 'hedge_options'
             containing the respective DataFrames
         
         Raises:
             ValueError: If required data cannot be fetched
         """
         print("Loading all required data")
-        results = {}
+        results: Dict[str, Any] = {}
         
         # 1. Fetch and save market data
         market_data = self.fetch_stock_data(symbols, use_cache=use_cache)
@@ -845,6 +959,32 @@ class DataLoader:
             print(f"Generated {len(positions)} positions")
         else:
             results['positions'] = None
+        
+        # 5. Fetch and save options chains for hedge symbols (SPY, QQQ, IWM by default)
+        if hedge_option_symbols is None:
+            hedge_option_symbols = ['SPY', 'QQQ', 'IWM']
+        if hedge_option_symbols:
+            print(f"Fetching hedge options for {hedge_option_symbols}")
+            hedge_options = self.fetch_options_chains_for_hedge_symbols(
+                hedge_option_symbols, use_cache=use_cache
+            )
+            if not hedge_options.empty:
+                self.save_data(hedge_options, "hedge_options.csv",
+                              metadata={'symbols': hedge_option_symbols, 'num_options': len(hedge_options)})
+                results['hedge_options'] = hedge_options
+                print(f"Saved {len(hedge_options)} hedge options")
+            else:
+                empty_opts = pd.DataFrame({
+                    'symbol': [], 'expiry': [], 'strike': [], 'option_type': [],
+                    'lastPrice': [], 'volume': [], 'openInterest': [],
+                    'impliedVolatility': [], 'bid': [], 'ask': [],
+                    'underlying_spot': [], 'dividend_yield': []
+                })
+                self.save_data(empty_opts, "hedge_options.csv",
+                              metadata={'symbols': hedge_option_symbols, 'num_options': 0})
+                results['hedge_options'] = empty_opts
+        else:
+            results['hedge_options'] = None
         
         print("Data loading complete")
         
