@@ -110,7 +110,9 @@ class DataLoader:
             spot = self._get_price(ticker, info)
             dy = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0.0
             dy = float(dy) if dy is not None else 0.0
-            if dy > 1.0:
+            # Normalize dividend yield: yfinance sometimes returns as percentage
+            # No stock has >20% dividend yield, so normalize if > 0.20
+            if dy > 0.20:
                 dy = dy / 100.0
             return (float(spot) if spot is not None else np.nan, dy)
         except (TypeError, AttributeError, ValueError, KeyError):
@@ -157,7 +159,9 @@ class DataLoader:
         short_factor = 50 if short_pct > 20 else (20 if short_pct > 10 else 0)
         
         dy = float(info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0)
-        if dy > 1.0:
+        # Normalize dividend yield: yfinance sometimes returns as percentage
+        # No stock has >20% dividend yield, so normalize if > 0.20
+        if dy > 0.20:
             dy = dy / 100.0
         dividend_bps = min(dy * 10000, 1000.0)
         
@@ -308,6 +312,11 @@ class DataLoader:
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
+                dividend_yield = float(dividend_yield) if dividend_yield is not None else 0.0
+                # Normalize dividend yield: yfinance sometimes returns as percentage (1.07 for 1.07%)
+                # instead of decimal (0.0107). No stock has >20% dividend yield, so normalize if > 0.20
+                if dividend_yield > 0.20:
+                    dividend_yield = dividend_yield / 100.0
                 borrow = self._estimate_borrow_cost_from_liquidity(info, spot_price, borrow_cap_bps=self.borrow_cap_bps)
                 tx = self._estimate_transaction_cost_from_liquidity(info, spot_price)
                 borrow_cost_bps = borrow["total_bps"]
@@ -568,74 +577,6 @@ class DataLoader:
         except (AttributeError, KeyError, ValueError, TypeError):
             return pd.DataFrame()
     
-    def fetch_options_chains_for_hedge_symbols(
-        self,
-        symbols: List[str],
-        use_cache: bool = True,
-        min_volume: int = 0,
-        min_open_interest: int = 0,
-    ) -> pd.DataFrame:
-        """
-        Fetch and combine options chains for hedge symbols (e.g. SPY, QQQ, IWM) with
-        underlying spot and dividend yield. Reuses fetch_stock_data, fetch_options_chain,
-        and _get_spot_and_dividend (which uses _get_price).
-        
-        Args:
-            symbols: Underlying symbols to fetch options for (e.g. ['SPY', 'QQQ', 'IWM'])
-            use_cache: If True, use cached per-symbol options chains when valid
-            min_volume: Minimum volume to keep (passed to fetch_options_chain; 0 = no extra filter)
-            min_open_interest: Minimum open interest to keep (passed to fetch_options_chain; 0 = no extra filter)
-        
-        Returns:
-            DataFrame with columns: symbol, expiry, strike, option_type, lastPrice,
-            volume, openInterest, impliedVolatility, bid, ask, underlying_spot, dividend_yield
-        """
-        if not symbols:
-            return pd.DataFrame()
-        
-        # Reuse fetch_stock_data for underlying spot and dividend yield
-        spot_by: Dict[str, float] = {}
-        div_by: Dict[str, float] = {}
-        try:
-            stock_df = self.fetch_stock_data(symbols, use_cache=use_cache)
-            for _, r in stock_df.iterrows():
-                s = str(r['symbol'])
-                spot_by[s] = float(r['spot_price'])
-                div_by[s] = float(r.get('dividend_yield', 0.0) or 0.0)
-        except (ValueError, KeyError, Exception):
-            pass
-        
-        # Fallback for symbols missing from fetch_stock_data: try fetch_stock_data([s]), else _get_spot_and_dividend
-        for s in symbols:
-            if s in spot_by:
-                continue
-            try:
-                one = self.fetch_stock_data([s], use_cache=use_cache)
-                if not one.empty:
-                    spot_by[s] = float(one.iloc[0]['spot_price'])
-                    div_by[s] = float(one.iloc[0].get('dividend_yield', 0.0) or 0.0)
-                else:
-                    spot_by[s], div_by[s] = self._get_spot_and_dividend(s)
-            except Exception:
-                spot_by[s], div_by[s] = self._get_spot_and_dividend(s)
-        
-        # Reuse fetch_options_chain (with liquidity params) and enrich with underlying_spot, dividend_yield
-        all_chains: List[pd.DataFrame] = []
-        for symbol in symbols:
-            chain = self.fetch_options_chain(
-                symbol, use_cache=use_cache, min_volume=min_volume, min_open_interest=min_open_interest
-            )
-            if chain.empty:
-                continue
-            chain = chain.copy()
-            chain['underlying_spot'] = spot_by.get(symbol, np.nan)
-            chain['dividend_yield'] = div_by.get(symbol, 0.0)
-            all_chains.append(chain)
-        
-        if not all_chains:
-            return pd.DataFrame()
-        return pd.concat(all_chains, ignore_index=True)
-    
     def build_volatility_surface(self, symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
         """
         Build volatility surface from options chains.
@@ -895,7 +836,6 @@ class DataLoader:
         seed: Optional[int] = None,
         use_cache: bool = True,
         generate_positions: bool = True,
-        hedge_option_symbols: Optional[List[str]] = None,
     ) -> Dict[str, pd.DataFrame]:
         """
         Do-it-all function: Fetches all required data and saves to expected file names.
@@ -905,7 +845,6 @@ class DataLoader:
         2. Fetches risk-free rates → saves as 'rates.csv'
         3. Builds volatility surface → saves as 'vol_surface.csv'
         4. Generates synthetic positions → saves as 'positions.csv'
-        5. Fetches options chains for hedge symbols → saves as 'hedge_options.csv'
         
         Args:
             symbols: List of stock symbols to fetch data for
@@ -913,10 +852,9 @@ class DataLoader:
             seed: Random seed for position generation (for reproducibility)
             use_cache: If True, use cached data when available
             generate_positions: If True, generate synthetic positions; if False, skip
-            hedge_option_symbols: Symbols to fetch options chains for hedging (default: ['SPY', 'QQQ', 'IWM'])
         
         Returns:
-            Dictionary with keys: 'market_data', 'rates', 'vol_surface', 'positions', 'hedge_options'
+            Dictionary with keys: 'market_data', 'rates', 'vol_surface', 'positions'
             containing the respective DataFrames
         
         Raises:
@@ -959,32 +897,6 @@ class DataLoader:
             print(f"Generated {len(positions)} positions")
         else:
             results['positions'] = None
-        
-        # 5. Fetch and save options chains for hedge symbols (SPY, QQQ, IWM by default)
-        if hedge_option_symbols is None:
-            hedge_option_symbols = ['SPY', 'QQQ', 'IWM']
-        if hedge_option_symbols:
-            print(f"Fetching hedge options for {hedge_option_symbols}")
-            hedge_options = self.fetch_options_chains_for_hedge_symbols(
-                hedge_option_symbols, use_cache=use_cache
-            )
-            if not hedge_options.empty:
-                self.save_data(hedge_options, "hedge_options.csv",
-                              metadata={'symbols': hedge_option_symbols, 'num_options': len(hedge_options)})
-                results['hedge_options'] = hedge_options
-                print(f"Saved {len(hedge_options)} hedge options")
-            else:
-                empty_opts = pd.DataFrame({
-                    'symbol': [], 'expiry': [], 'strike': [], 'option_type': [],
-                    'lastPrice': [], 'volume': [], 'openInterest': [],
-                    'impliedVolatility': [], 'bid': [], 'ask': [],
-                    'underlying_spot': [], 'dividend_yield': []
-                })
-                self.save_data(empty_opts, "hedge_options.csv",
-                              metadata={'symbols': hedge_option_symbols, 'num_options': 0})
-                results['hedge_options'] = empty_opts
-        else:
-            results['hedge_options'] = None
         
         print("Data loading complete")
         
@@ -1034,6 +946,10 @@ class DataLoader:
                     continue
                 
                 dividend_yield = info.get('dividendYield') or 0.0
+                dividend_yield = float(dividend_yield) if dividend_yield is not None else 0.0
+                # Normalize dividend yield: yfinance sometimes returns as percentage
+                if dividend_yield > 0.20:
+                    dividend_yield = dividend_yield / 100.0
                 borrow = self._estimate_borrow_cost_from_liquidity(info, spot_price, borrow_cap_bps=self.borrow_cap_bps)
                 tx = self._estimate_transaction_cost_from_liquidity(info, spot_price)
                 borrow_cost_bps = borrow["total_bps"]

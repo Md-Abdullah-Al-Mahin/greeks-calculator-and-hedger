@@ -7,7 +7,8 @@ import os
 
 # Constants
 DEFAULT_VOLATILITY = 0.25  # Default implied volatility (25%)
-MIN_VOLATILITY = 0.01  # Minimum reasonable volatility (1%) to avoid numerical issues
+MIN_VOLATILITY = 0.10  # Minimum reasonable volatility (10%) to avoid numerical issues
+                       # (1% was too low - caused delta ~0.93 for ATM calls due to rate dominance)
 DAYS_PER_YEAR = 365.0
 
 
@@ -167,6 +168,11 @@ class GreeksCalculator:
         Returns:
             Dictionary with delta, gamma, vega, theta, rho
         """
+        # Normalize dividend yield: if > 0.20 (20%), assume it's a percentage and convert
+        # No stock has >20% dividend yield, so this is a safe heuristic
+        if dividend_yield > 0.20:
+            dividend_yield = dividend_yield / 100.0
+        
         # Handle edge cases
         if time_to_expiry <= 0:
             # Option expired
@@ -361,6 +367,10 @@ class GreeksCalculator:
             row = positions.loc[idx]
             # Get dividend yield, defaulting to 0.0 if not available
             dividend_yield = float(row.get('dividend_yield', 0.0)) if 'dividend_yield' in row else 0.0
+            # Normalize dividend yield: if > 0.20 (20%), assume it's a percentage and convert
+            # No stock has >20% dividend yield, so this is a safe heuristic
+            if dividend_yield > 0.20:
+                dividend_yield = dividend_yield / 100.0
             greeks = self.compute_black_scholes_greeks(
                 spot=float(row['spot_price']),
                 strike=float(row['strike']),
