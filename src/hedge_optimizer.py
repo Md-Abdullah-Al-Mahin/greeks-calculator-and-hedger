@@ -295,20 +295,105 @@ class HedgeOptimizer:
             'delta_per_unit': hedge_universe['delta_per_unit'].values.astype(float),
             'rho_per_unit': rho_per_unit,
             'n_instruments': n,
+            'symbols': hedge_universe['symbol'].tolist(),
         }
+    
+    def _get_portfolio_exposures_by_symbol(self) -> Dict[str, float]:
+        """
+        Get portfolio dollar delta exposure per symbol for correlation-aware hedging.
+        
+        Returns:
+            Dictionary mapping symbol to its total delta exposure (dollar delta).
+        """
+        try:
+            breakdown = self.portfolio_aggregator.load_and_aggregate_by_symbol()
+            if breakdown.empty:
+                return {}
+            return {str(row['symbol']): float(row['delta']) for _, row in breakdown.iterrows()}
+        except (FileNotFoundError, KeyError, AttributeError):
+            return {}
+    
+    def _build_variance_terms(self, portfolio_exposures_by_symbol: Dict[str, float],
+                              hedge_symbols: List[str],
+                              cov_matrix: np.ndarray,
+                              cov_symbols: List[str],
+                              hedge_spot_prices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build Q matrix and c vector for variance minimization term: h'Qh + c'h
+        
+        This enables correlation-aware hedging by adding a variance penalty
+        to the objective function that considers cross-correlations between
+        portfolio positions and hedge instruments.
+        
+        Args:
+            portfolio_exposures_by_symbol: Dict mapping portfolio symbol to dollar delta
+            hedge_symbols: List of hedge instrument symbols (in order)
+            cov_matrix: Return covariance matrix
+            cov_symbols: List of symbols corresponding to cov_matrix rows/cols
+            hedge_spot_prices: Spot prices of hedge instruments (same order as hedge_symbols)
+        
+        Returns:
+            Tuple of (Q, c) where:
+            - Q: n_hedge x n_hedge matrix for h'Qh term (hedge-hedge covariance)
+            - c: n_hedge vector for c'h term (cross-covariance with portfolio)
+        """
+        n_hedge = len(hedge_symbols)
+        
+        if n_hedge == 0 or cov_matrix.size == 0:
+            return np.zeros((0, 0)), np.zeros(0)
+        
+        # Build symbol-to-index mapping for covariance matrix
+        cov_idx = {s: i for i, s in enumerate(cov_symbols)}
+        
+        # Q = Σ_HH (hedge-hedge covariance block)
+        Q = np.zeros((n_hedge, n_hedge))
+        for i, si in enumerate(hedge_symbols):
+            for j, sj in enumerate(hedge_symbols):
+                if si in cov_idx and sj in cov_idx:
+                    Q[i, j] = cov_matrix[cov_idx[si], cov_idx[sj]]
+        
+        # Scale to dollar terms: Q_dollar = diag(S) @ Q_return @ diag(S)
+        # This converts return covariance to dollar P&L covariance
+        S = np.diag(hedge_spot_prices)
+        Q = S @ Q @ S
+        
+        # c = 2 * Σ_PH' @ p (cross-covariance with portfolio, scaled by prices)
+        # The cross-term 2p'Σh in the variance becomes c'h with c = 2 * Σ_HP @ p
+        c = np.zeros(n_hedge)
+        for i, h_sym in enumerate(hedge_symbols):
+            if h_sym not in cov_idx:
+                continue
+            h_idx = cov_idx[h_sym]
+            for p_sym, p_exp in portfolio_exposures_by_symbol.items():
+                if p_sym in cov_idx:
+                    p_idx = cov_idx[p_sym]
+                    # Covariance between hedge i and portfolio symbol
+                    cov_ph = cov_matrix[p_idx, h_idx]
+                    # Scale by spot prices for dollar terms
+                    c[i] += 2 * cov_ph * p_exp * hedge_spot_prices[i]
+        
+        return Q, c
     
     def _build_objective_function(self, spot_prices: np.ndarray, transaction_costs_bps: np.ndarray,
                                   borrow_costs_bps: np.ndarray, portfolio_delta: float, portfolio_rho: float,
                                   delta_target: float, rho_target: float,
                                   delta_per_unit: np.ndarray, rho_per_unit: np.ndarray,
-                                  holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS):
+                                  holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS,
+                                  variance_Q: Optional[np.ndarray] = None,
+                                  variance_c: Optional[np.ndarray] = None,
+                                  variance_penalty: float = 0.0):
         """
         Build objective function that minimizes total hedging cost and penalizes deviation from targets.
+        
+        Optionally includes a variance term for correlation-aware hedging.
         
         Args:
             holding_period_years: Holding period in years for scaling annualized borrow costs.
                                  Default is 1.0 year, which means borrow costs (annualized bps) are
                                  applied as one-time costs for a 1-year holding period.
+            variance_Q: Optional n x n matrix for quadratic variance term h'Qh
+            variance_c: Optional n vector for linear variance term c'h (cross-covariance)
+            variance_penalty: Weight on variance term (lambda). If 0, variance term is ignored.
         """
         # Compute dynamic penalty scales to avoid numerical conditioning issues
         # Scale penalties so initial penalty is O(1000) regardless of portfolio size
@@ -320,6 +405,12 @@ class HedgeOptimizer:
         target_penalty = 1000.0
         delta_scale = target_penalty / max(delta_deviation ** 2, 1.0)
         rho_scale = target_penalty / max(rho_deviation ** 2, 1.0)
+        
+        # Check if we should use variance term
+        use_variance = (variance_penalty > 0 and 
+                       variance_Q is not None and 
+                       variance_c is not None and
+                       variance_Q.size > 0)
         
         def objective(x):
             # Cost component
@@ -341,7 +432,15 @@ class HedgeOptimizer:
             delta_penalty = (residual_delta - delta_target) ** 2 * delta_scale
             rho_penalty = (residual_rho - rho_target) ** 2 * rho_scale
             
-            return total_cost + delta_penalty + rho_penalty
+            result = total_cost + delta_penalty + rho_penalty
+            
+            # Variance term for correlation-aware hedging: λ * (h'Qh + c'h)
+            # This minimizes Var(Portfolio + Hedge) by considering cross-correlations
+            if use_variance:
+                variance_term = x @ variance_Q @ x + variance_c @ x
+                result += variance_penalty * variance_term
+            
+            return result
         return objective
     
     def _build_constraints(self, portfolio_delta: float, portfolio_rho: float,
@@ -465,9 +564,14 @@ class HedgeOptimizer:
     def optimize_hedge_portfolio(self, portfolio_exposures: Dict, hedge_universe: pd.DataFrame,
                                  market_data: pd.DataFrame, targets: Dict, 
                                  constraints: Optional[Dict] = None,
-                                 holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
+                                 holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS,
+                                 use_correlation: bool = False,
+                                 variance_penalty: float = 0.0,
+                                 correlation_lookback_days: int = 252) -> Tuple[pd.DataFrame, Dict]:
         """
         Solve constrained optimization problem to meet targets at minimal cost.
+        
+        Optionally uses correlation-aware hedging to minimize portfolio variance.
         
         Args:
             portfolio_exposures: Current portfolio greeks summary with keys:
@@ -486,6 +590,13 @@ class HedgeOptimizer:
             holding_period_years: Holding period in years for scaling annualized borrow costs.
                                  Borrow costs are annualized basis points, so they are scaled by
                                  this holding period to get the actual cost. Default is 1.0 year.
+            use_correlation: If True, enable correlation-aware hedging that minimizes
+                            Var(Portfolio + Hedge) by considering cross-correlations.
+            variance_penalty: Weight on variance term (lambda). Higher values emphasize
+                             variance reduction vs cost minimization. Only used if use_correlation=True.
+                             Recommended range: 0.01 to 1.0. Default: 0.0 (disabled).
+            correlation_lookback_days: Number of days for historical return correlation estimation.
+                                       Default: 252 (1 year).
         
         Returns:
             Tuple of (hedge_recommendations DataFrame, optimization_summary Dict)
@@ -503,7 +614,53 @@ class HedgeOptimizer:
         # Extract hedge instrument parameters
         instrument_params = self._extract_hedge_instrument_parameters(hedge_universe)
         
-        # Build objective function
+        # Initialize variance terms (None by default, computed if correlation-aware hedging enabled)
+        variance_Q: Optional[np.ndarray] = None
+        variance_c: Optional[np.ndarray] = None
+        cov_data: Optional[Tuple[np.ndarray, List[str]]] = None
+        
+        # Build variance terms if correlation-aware hedging is enabled
+        if use_correlation and variance_penalty > 0:
+            try:
+                # Import DataLoader for covariance computation
+                try:
+                    from .data_loader import DataLoader
+                except ImportError:
+                    from data_loader import DataLoader
+                
+                # Get portfolio exposures by symbol
+                portfolio_by_symbol = self._get_portfolio_exposures_by_symbol()
+                
+                if portfolio_by_symbol:
+                    # Collect all symbols (portfolio + hedge)
+                    hedge_symbols = instrument_params['symbols']
+                    all_symbols = list(set(portfolio_by_symbol.keys()) | set(hedge_symbols))
+                    
+                    # Compute covariance matrix
+                    loader = DataLoader(self.data_dir)
+                    cov_matrix, cov_symbols = loader.compute_covariance_matrix(
+                        all_symbols, 
+                        lookback_days=correlation_lookback_days,
+                        use_cache=True
+                    )
+                    cov_data = (cov_matrix, cov_symbols)
+                    
+                    # Build variance terms
+                    variance_Q, variance_c = self._build_variance_terms(
+                        portfolio_by_symbol,
+                        hedge_symbols,
+                        cov_matrix,
+                        cov_symbols,
+                        instrument_params['spot_prices']
+                    )
+                    
+                    print(f"Correlation-aware hedging enabled (λ={variance_penalty}, lookback={correlation_lookback_days}d)")
+                else:
+                    print("Warning: No portfolio symbol breakdown available, skipping correlation-aware hedging")
+            except Exception as e:
+                print(f"Warning: Could not compute covariance matrix, skipping correlation-aware hedging: {str(e)}")
+        
+        # Build objective function (with optional variance terms)
         objective = self._build_objective_function(
             instrument_params['spot_prices'],
             instrument_params['transaction_costs_bps'],
@@ -515,6 +672,9 @@ class HedgeOptimizer:
             instrument_params['delta_per_unit'],
             instrument_params['rho_per_unit'],
             holding_period_years=holding_period_years,
+            variance_Q=variance_Q,
+            variance_c=variance_c,
+            variance_penalty=variance_penalty,
         )
         
         # Build constraints
@@ -563,7 +723,74 @@ class HedgeOptimizer:
             portfolio_exposures
         )
         
+        # Add correlation-aware hedging info to summary
+        optimization_summary['correlation_aware'] = use_correlation and variance_penalty > 0
+        optimization_summary['variance_penalty'] = variance_penalty if use_correlation else 0.0
+        
+        # If correlation-aware, compute variance metrics
+        if use_correlation and variance_penalty > 0 and cov_data is not None:
+            try:
+                cov_matrix, cov_symbols = cov_data
+                portfolio_by_symbol = self._get_portfolio_exposures_by_symbol()
+                
+                # Compute portfolio variance before hedging
+                p_var_before = self._compute_portfolio_variance(
+                    portfolio_by_symbol, cov_matrix, cov_symbols
+                )
+                
+                # Compute portfolio variance after hedging
+                hedge_exposures = {
+                    instrument_params['symbols'][i]: hedge_quantities[i] * instrument_params['spot_prices'][i]
+                    for i in range(len(hedge_quantities))
+                    if abs(hedge_quantities[i]) > QUANTITY_TOLERANCE
+                }
+                combined_exposures = {**portfolio_by_symbol}
+                for sym, exp in hedge_exposures.items():
+                    combined_exposures[sym] = combined_exposures.get(sym, 0.0) + exp
+                
+                p_var_after = self._compute_portfolio_variance(
+                    combined_exposures, cov_matrix, cov_symbols
+                )
+                
+                optimization_summary['portfolio_variance_before'] = float(p_var_before)
+                optimization_summary['portfolio_variance_after'] = float(p_var_after)
+                if p_var_before > 0:
+                    optimization_summary['variance_reduction_pct'] = float(
+                        (p_var_before - p_var_after) / p_var_before * 100
+                    )
+                else:
+                    optimization_summary['variance_reduction_pct'] = 0.0
+            except Exception:
+                # Silently ignore variance computation errors
+                pass
+        
         return hedge_recommendations_df, optimization_summary
+    
+    def _compute_portfolio_variance(self, exposures_by_symbol: Dict[str, float],
+                                    cov_matrix: np.ndarray,
+                                    cov_symbols: List[str]) -> float:
+        """
+        Compute portfolio variance given exposures and covariance matrix.
+        
+        Var = sum_i sum_j exp_i * exp_j * cov(i,j)
+        """
+        if not exposures_by_symbol or cov_matrix.size == 0:
+            return 0.0
+        
+        cov_idx = {s: i for i, s in enumerate(cov_symbols)}
+        
+        variance = 0.0
+        for sym_i, exp_i in exposures_by_symbol.items():
+            if sym_i not in cov_idx:
+                continue
+            i = cov_idx[sym_i]
+            for sym_j, exp_j in exposures_by_symbol.items():
+                if sym_j not in cov_idx:
+                    continue
+                j = cov_idx[sym_j]
+                variance += exp_i * exp_j * cov_matrix[i, j]
+        
+        return variance
     
     def _create_empty_hedge_results(self, portfolio_delta: float, portfolio_rho: float,
                                    delta_target: float, rho_target: float) -> Tuple[pd.DataFrame, Dict]:
@@ -740,8 +967,20 @@ class HedgeOptimizer:
         return pd.read_csv(market_data_path)
     
     def run_pipeline(self, targets: Optional[Dict] = None, 
-                    holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
-        """Run the complete hedge optimization pipeline."""
+                    holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS,
+                    use_correlation: bool = False,
+                    variance_penalty: float = 0.0,
+                    correlation_lookback_days: int = 252) -> Tuple[pd.DataFrame, Dict]:
+        """
+        Run the complete hedge optimization pipeline.
+        
+        Args:
+            targets: Optional dict with delta_target, delta_tolerance, rho_target, rho_tolerance
+            holding_period_years: Holding period for borrow cost calculation
+            use_correlation: Enable correlation-aware hedging
+            variance_penalty: Weight on variance term (0.0 to 1.0)
+            correlation_lookback_days: Days of history for correlation estimation
+        """
         symbols = self.portfolio_aggregator.get_unique_symbols()
         targets = targets or {
             'delta_target': 0.0,
@@ -754,7 +993,10 @@ class HedgeOptimizer:
         market_data = self.load_market_data() if os.path.exists(os.path.join(self.data_dir, "market_data.csv")) else pd.DataFrame()
         hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(
             portfolio_exposures, hedge_universe, market_data, targets,
-            holding_period_years=holding_period_years
+            holding_period_years=holding_period_years,
+            use_correlation=use_correlation,
+            variance_penalty=variance_penalty,
+            correlation_lookback_days=correlation_lookback_days
         )
         self.save_hedge_tickets(hedge_recommendations)
         self.save_optimization_summary(optimization_summary)
@@ -763,7 +1005,10 @@ class HedgeOptimizer:
     def run_end_to_end(self, symbols: List[str], targets: Dict,
                       hedge_config: Optional[Dict] = None,
                       save_results: bool = True,
-                      holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS) -> Tuple[pd.DataFrame, Dict]:
+                      holding_period_years: float = DEFAULT_HOLDING_PERIOD_YEARS,
+                      use_correlation: bool = False,
+                      variance_penalty: float = 0.0,
+                      correlation_lookback_days: int = 252) -> Tuple[pd.DataFrame, Dict]:
         """
         Run the complete hedge optimization pipeline end-to-end.
         
@@ -791,6 +1036,9 @@ class HedgeOptimizer:
             holding_period_years: Holding period in years for scaling annualized borrow costs.
                                  Borrow costs are annualized basis points, so they are scaled by
                                  this holding period. Default is 1.0 year.
+            use_correlation: Enable correlation-aware hedging to minimize portfolio variance.
+            variance_penalty: Weight on variance term (0.0 to 1.0). Higher = more variance reduction.
+            correlation_lookback_days: Days of history for correlation estimation (default: 252).
         
         Returns:
             Tuple of (hedge_recommendations DataFrame, optimization_summary Dict)
@@ -827,14 +1075,23 @@ class HedgeOptimizer:
             print(f"  Warning: {str(e)}")
             market_data = pd.DataFrame()
         
+        if use_correlation and variance_penalty > 0:
+            print(f"\nCorrelation-aware hedging: λ={variance_penalty}, lookback={correlation_lookback_days}d")
+        
         print("\nOptimizing...")
         hedge_recommendations, optimization_summary = self.optimize_hedge_portfolio(
             portfolio_exposures, hedge_universe, market_data, targets,
-            holding_period_years=holding_period_years
+            holding_period_years=holding_period_years,
+            use_correlation=use_correlation,
+            variance_penalty=variance_penalty,
+            correlation_lookback_days=correlation_lookback_days
         )
         s = optimization_summary
         print(f"  Status: {s['solver_status']}, Trades: {s['num_hedge_trades']}, Cost: ${s['total_hedge_cost']:,.2f}")
         print(f"  Residual Delta: {s['residual_delta']:,.2f}, Rho: {s['residual_rho']:,.2f}, Effectiveness: {s['hedge_effectiveness_pct']:.1f}%")
+        
+        if s.get('correlation_aware') and 'variance_reduction_pct' in s:
+            print(f"  Variance Reduction: {s['variance_reduction_pct']:.1f}%")
         
         if save_results:
             print("\nSaving results...")

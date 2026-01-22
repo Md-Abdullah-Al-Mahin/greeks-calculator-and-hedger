@@ -351,6 +351,42 @@ class DashboardUI:
                 default_transaction_cost = st.number_input("Default Transaction Cost (bps)", value=5.0, step=0.1, key="hedge_transaction_cost")
                 default_max_quantity = st.number_input("Default Max Quantity", value=100000.0, step=1000.0, key="hedge_max_quantity")
 
+            with st.expander("Correlation-Aware Hedging"):
+                st.markdown("""
+                **Portfolio Variance Minimization**
+                
+                When enabled, the optimizer considers correlations between portfolio positions and 
+                hedge instruments to minimize overall portfolio variance, not just delta/rho.
+                """)
+                use_correlation = st.checkbox(
+                    "Enable correlation-aware hedging",
+                    value=False,
+                    key="hedge_use_correlation",
+                    help="Consider correlations between portfolio and hedge instruments to minimize variance"
+                )
+                if use_correlation:
+                    variance_penalty = st.slider(
+                        "Variance penalty (λ)",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=0.1,
+                        step=0.01,
+                        key="hedge_variance_penalty",
+                        help="Higher values emphasize variance reduction vs cost minimization. Recommended: 0.05-0.2"
+                    )
+                    correlation_lookback = st.number_input(
+                        "Correlation lookback (days)",
+                        min_value=30,
+                        max_value=504,
+                        value=252,
+                        step=21,
+                        key="hedge_correlation_lookback",
+                        help="Number of trading days for historical correlation estimation (252 = ~1 year)"
+                    )
+                else:
+                    variance_penalty = 0.0
+                    correlation_lookback = 252
+
             targets = {"delta_target": delta_target, "delta_tolerance": delta_tolerance, "rho_target": rho_target, "rho_tolerance": rho_tolerance}
             hedge_config = {
                 "include_etfs": include_etfs,
@@ -372,7 +408,10 @@ class DashboardUI:
                         except FileNotFoundError:
                             market_data = pd.DataFrame()
                         hedge_recommendations, optimization_summary = optimizer.optimize_hedge_portfolio(
-                            st.session_state.portfolio_exposures, hedge_universe, market_data, targets
+                            st.session_state.portfolio_exposures, hedge_universe, market_data, targets,
+                            use_correlation=use_correlation,
+                            variance_penalty=variance_penalty,
+                            correlation_lookback_days=correlation_lookback
                         )
                         st.session_state.hedge_recommendations = hedge_recommendations
                         st.session_state.optimization_summary = optimization_summary
@@ -401,6 +440,27 @@ class DashboardUI:
                     st.metric("Residual Delta", f"{summary['residual_delta']:,.2f}")
                 with col6:
                     st.metric("Residual Rho", f"{summary['residual_rho']:,.2f}")
+                
+                # Show correlation-aware hedging results if enabled
+                if summary.get('correlation_aware') and 'variance_reduction_pct' in summary:
+                    st.divider()
+                    st.markdown("**Correlation-Aware Hedging Results**")
+                    col7, col8, col9 = st.columns(3)
+                    with col7:
+                        st.metric("Variance Penalty (λ)", f"{summary.get('variance_penalty', 0):.3f}")
+                    with col8:
+                        var_reduction = summary.get('variance_reduction_pct', 0)
+                        st.metric("Variance Reduction", f"{var_reduction:.1f}%", 
+                                  delta=f"{var_reduction:.1f}%" if var_reduction > 0 else None,
+                                  delta_color="normal")
+                    with col9:
+                        if 'portfolio_variance_before' in summary and 'portfolio_variance_after' in summary:
+                            var_before = summary['portfolio_variance_before']
+                            var_after = summary['portfolio_variance_after']
+                            st.metric("Portfolio Volatility", 
+                                      f"{(var_after ** 0.5 * 100):.1f}%",
+                                      delta=f"-{((var_before ** 0.5 - var_after ** 0.5) * 100):.1f}%",
+                                      delta_color="inverse")
                 st.subheader("Hedge Recommendations")
                 if st.session_state.hedge_recommendations is not None and not st.session_state.hedge_recommendations.empty:
                     rec = st.session_state.hedge_recommendations

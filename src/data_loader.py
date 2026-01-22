@@ -1031,3 +1031,190 @@ class DataLoader:
                       metadata={'symbols': symbols, 'num_symbols': len(df)})
         print(f"Fetched Treasury ETF data for {len(df)} symbols")
         return df
+    
+    def fetch_historical_returns(self, symbols: List[str], lookback_days: int = 252,
+                                  use_cache: bool = True) -> pd.DataFrame:
+        """
+        Fetch historical daily log returns for symbols, aligned on common dates.
+        
+        Used for correlation-aware hedging to compute covariance matrices.
+        
+        Args:
+            symbols: List of stock/ETF symbols to fetch returns for
+            lookback_days: Number of trading days to look back (default: 252 = ~1 year)
+            use_cache: If True, load from cache if available and valid
+        
+        Returns:
+            DataFrame with columns=symbols, index=dates, values=log returns.
+            Only symbols with sufficient data are included.
+        """
+        if not symbols:
+            return pd.DataFrame()
+        
+        # Create cache key from sorted symbols and lookback
+        sorted_symbols = sorted(set(symbols))
+        cache_key = f"returns_{lookback_days}_{'_'.join(sorted_symbols[:10])}"
+        if len(sorted_symbols) > 10:
+            # Hash for longer symbol lists to avoid too-long filenames
+            import hashlib
+            symbols_hash = hashlib.md5('_'.join(sorted_symbols).encode()).hexdigest()[:8]
+            cache_key = f"returns_{lookback_days}_{symbols_hash}"
+        
+        if use_cache:
+            cached = self._load_from_cache(cache_key)
+            if cached is not None:
+                # Validate cached data has the symbols we need
+                cached_symbols = set(cached.columns)
+                requested_symbols = set(symbols)
+                if requested_symbols.issubset(cached_symbols):
+                    print(f"Using cached historical returns for {len(symbols)} symbols")
+                    return cached[list(symbols)]
+        
+        print(f"Fetching historical returns for {len(symbols)} symbols ({lookback_days} days)")
+        
+        prices: Dict[str, pd.Series] = {}
+        failed_symbols = []
+        
+        for symbol in symbols:
+            try:
+                ticker = yf.Ticker(symbol)
+                # Fetch slightly more days to ensure we have enough after alignment
+                hist = ticker.history(period=f"{lookback_days + 30}d")
+                if not hist.empty and 'Close' in hist.columns:
+                    # Use the Close price series
+                    prices[symbol] = hist['Close']
+                else:
+                    failed_symbols.append(symbol)
+            except Exception as e:
+                failed_symbols.append(symbol)
+                continue
+        
+        if failed_symbols:
+            print(f"Warning: Could not fetch history for {len(failed_symbols)} symbol(s): {', '.join(failed_symbols[:5])}{'...' if len(failed_symbols) > 5 else ''}")
+        
+        if not prices:
+            print("Warning: No historical price data could be fetched")
+            return pd.DataFrame()
+        
+        # Combine into DataFrame, aligning on common dates
+        df_prices = pd.DataFrame(prices)
+        
+        # Compute log returns
+        returns = np.log(df_prices / df_prices.shift(1))
+        
+        # Drop rows with NaN (first row and any missing data)
+        returns = returns.dropna()
+        
+        # Limit to requested lookback
+        if len(returns) > lookback_days:
+            returns = returns.iloc[-lookback_days:]
+        
+        if use_cache and not returns.empty:
+            self._save_to_cache(returns.reset_index(), cache_key)
+        
+        print(f"Fetched returns for {len(returns.columns)} symbols, {len(returns)} days")
+        return returns
+    
+    def compute_covariance_matrix(self, symbols: List[str], lookback_days: int = 252,
+                                   annualize: bool = True,
+                                   use_cache: bool = True) -> Tuple[np.ndarray, List[str]]:
+        """
+        Compute covariance matrix of returns with Ledoit-Wolf shrinkage.
+        
+        Used for correlation-aware hedging. Shrinkage ensures the matrix is
+        positive semi-definite and numerically stable.
+        
+        Args:
+            symbols: List of stock/ETF symbols to compute covariance for
+            lookback_days: Number of trading days for return estimation (default: 252)
+            annualize: If True, multiply by 252 to annualize daily covariance
+            use_cache: If True, use cached returns data if available
+        
+        Returns:
+            Tuple of (covariance_matrix, valid_symbols) where:
+            - covariance_matrix: np.ndarray of shape (n, n) 
+            - valid_symbols: List[str] of symbols in same order as matrix rows/cols
+        
+        Note:
+            If insufficient data, returns a diagonal matrix with 0.04 (20% annual vol)
+            as a reasonable fallback for equities.
+        """
+        if not symbols:
+            return np.array([[]]), []
+        
+        # Fetch historical returns
+        returns = self.fetch_historical_returns(symbols, lookback_days, use_cache=use_cache)
+        
+        if returns.empty:
+            print("Warning: No return data available, using default diagonal covariance")
+            n = len(symbols)
+            default_var = 0.04  # 20% annual volatility squared
+            return np.eye(n) * default_var, list(symbols)
+        
+        valid_symbols = list(returns.columns)
+        n_symbols = len(valid_symbols)
+        n_obs = len(returns)
+        
+        # Need at least 20 observations for reliable covariance estimation
+        min_observations = 20
+        if n_obs < min_observations:
+            print(f"Warning: Only {n_obs} observations, using diagonal covariance")
+            default_var = 0.04
+            return np.eye(n_symbols) * default_var, valid_symbols
+        
+        # Need at least 2 symbols for meaningful covariance
+        if n_symbols < 2:
+            print("Warning: Less than 2 symbols with data, using diagonal covariance")
+            var = returns.var().values[0] if not returns.empty else 0.04
+            if annualize:
+                var *= 252
+            return np.array([[var]]), valid_symbols
+        
+        # Try Ledoit-Wolf shrinkage for robust covariance estimation
+        try:
+            from sklearn.covariance import LedoitWolf
+            
+            # Fit Ledoit-Wolf estimator
+            lw = LedoitWolf()
+            lw.fit(returns.values)
+            cov_matrix = lw.covariance_
+            
+            print(f"Computed covariance matrix using Ledoit-Wolf shrinkage (shrinkage={lw.shrinkage_:.3f})")
+            
+        except ImportError:
+            # Fallback to simple shrinkage if sklearn not available
+            print("Warning: sklearn not available, using simple shrinkage")
+            sample_cov = returns.cov().values
+            
+            # Simple shrinkage toward diagonal
+            shrinkage = 0.2
+            target = np.diag(np.diag(sample_cov))
+            cov_matrix = (1 - shrinkage) * sample_cov + shrinkage * target
+        
+        except Exception as e:
+            # Fallback on any error
+            print(f"Warning: Covariance estimation failed ({str(e)}), using sample covariance")
+            cov_matrix = returns.cov().values
+        
+        # Annualize if requested (daily to annual: multiply by 252)
+        if annualize:
+            cov_matrix = cov_matrix * 252
+        
+        # Ensure matrix is symmetric (handle floating point errors)
+        cov_matrix = (cov_matrix + cov_matrix.T) / 2
+        
+        # Ensure positive semi-definite by clipping small negative eigenvalues
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+            min_eigenvalue = 1e-10
+            if np.any(eigenvalues < min_eigenvalue):
+                eigenvalues = np.maximum(eigenvalues, min_eigenvalue)
+                cov_matrix = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
+                print("Warning: Adjusted covariance matrix to ensure positive semi-definiteness")
+        except np.linalg.LinAlgError:
+            # If eigendecomposition fails, fall back to diagonal
+            print("Warning: Eigendecomposition failed, using diagonal covariance")
+            variances = np.diag(cov_matrix)
+            cov_matrix = np.diag(variances)
+        
+        return cov_matrix, valid_symbols
